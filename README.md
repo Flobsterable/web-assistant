@@ -42,6 +42,8 @@ cp .env.example .env
 
 Заполните `DEEPSEEK_API_KEY` в `.env`.
 
+Значения формы и ограничения также настраиваются через `.env`: `DEFAULT_PROMPT`, `DEFAULT_FORMAT`, `DEFAULT_MAX_TOKENS`, `DEFAULT_STOP_SEQUENCE`, `DEFAULT_RESPONSE_FORMAT`, `DEFAULT_CONSTRAINTS`, `MIN_ALLOWED_TOKENS`, `MAX_ALLOWED_TOKENS` и `MAX_STOP_SEQUENCE_LENGTH`. Backend отдаёт клиенту только безопасную конфигурацию через `GET /api/config`.
+
 ## Запуск в режиме разработки
 
 ```bash
@@ -58,11 +60,11 @@ npm run build
 npm start
 ```
 
-## Как работает поток
+## Как работает сравнение
 
-1. Пользователь вводит prompt в textarea на frontend.
-2. React отправляет `POST /api/chat` на backend.
-3. Express валидирует prompt и отправляет запрос в DeepSeek API.
-4. DeepSeek возвращает ответ модели на backend.
-5. Backend возвращает текст ответа на frontend.
-6. Frontend показывает ответ, загрузку или ошибку на странице.
+1. Пользователь задаёт исходный prompt и параметры контролируемого ответа.
+2. React отправляет один `POST /api/compare` на backend.
+3. Backend параллельно выполняет два запроса к DeepSeek: исходный и дополненный форматом, `max_tokens` и `stop`.
+4. Frontend показывает ответы рядом, а также число токенов и причину завершения.
+
+Переключатели в интерфейсе управляют ограничениями независимо: формат передаётся через `response_format` (для JSON), длина через `max_tokens`, а условие завершения через `stop`. Активные ограничения дополнительно описываются в инструкции контролируемого prompt.
