@@ -282,20 +282,16 @@ textarea:disabled {
   overflow: hidden;
 }
 
-.result-card.direct {
+.result-card.strict {
   border-top: 3px solid #7e8d97;
 }
 
-.result-card.steps {
+.result-card.balanced {
   border-top: 3px solid #2d806f;
 }
 
-.result-card.prompt {
+.result-card.creative {
   border-top: 3px solid #b66b33;
-}
-
-.result-card.experts {
-  border-top: 3px solid #596c9f;
 }
 
 .comparison-card {
@@ -373,6 +369,7 @@ textarea:disabled {
 
 .card-meta {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 12px;
   border-top: 1px solid #e2e8eb;
