@@ -8,16 +8,13 @@ type CompletionResult = {
 
 type MethodResult = CompletionResult & {
   prompt: string;
+  temperature: number;
 };
 
 type ComparisonResponse = {
-  direct: MethodResult;
-  stepByStep: MethodResult;
-  generatedPrompt: MethodResult & {
-    generatedPrompt: string;
-  };
-  experts: MethodResult;
-  comparison: CompletionResult;
+  temperatureZero: MethodResult;
+  temperatureBalanced: MethodResult;
+  temperatureHigh: MethodResult;
 };
 
 type AppConfig = {
@@ -36,33 +33,21 @@ function getFinishLabel(finishReason: string | null) {
 
 function ResultCard({
   title,
-  subtitle,
   result,
-  variant,
-  extra
+  variant
 }: {
   title: string;
-  subtitle: string;
   result?: MethodResult;
-  variant: 'direct' | 'steps' | 'prompt' | 'experts';
-  extra?: string;
+  variant: 'strict' | 'balanced' | 'creative';
 }) {
   return (
     <article className={`result-card ${variant}`}>
       <header className="card-header">
         <div>
           <h3>{title}</h3>
-          <p>{subtitle}</p>
         </div>
         {result && <span className="result-status">готово</span>}
       </header>
-
-      {extra && (
-        <details className="prompt-details">
-          <summary>Составленный запрос</summary>
-          <div>{extra}</div>
-        </details>
-      )}
 
       <div className={`answer ${result ? '' : 'answer-empty'}`}>
         {result ? result.answer : 'Ответ появится здесь'}
@@ -70,6 +55,7 @@ function ResultCard({
 
       {result && (
         <footer className="card-meta">
+          <span>temperature = {result.temperature}</span>
           <span>{result.completionTokens ?? '-'} токенов</span>
           <span>{getFinishLabel(result.finishReason)}</span>
         </footer>
@@ -171,7 +157,7 @@ export default function App() {
       <div className="app-frame">
         <header className="topbar">
           <div className="brand-lockup">
-            <h1>Сравнение решений</h1>
+            <h1>Сравнение temperature</h1>
           </div>
           <span className={`api-status ${config ? 'ready' : 'pending'}`}>
             <span className="status-dot" /> {config ? config.model : 'Подключение...'}
@@ -180,14 +166,13 @@ export default function App() {
 
         <section className="hero">
           <div>
-            <h2>Проверка подходов</h2>
+            <h2>Один запрос, три температуры</h2>
           </div>
-          <p>Введите задачу и сравните несколько вариантов ответа.</p>
         </section>
 
         <form className="request-card" onSubmit={handleSubmit}>
           <div className="request-header">
-            <label htmlFor="task">Задача</label>
+            <label htmlFor="task">Запрос</label>
             <div className="request-tools">
               <span>{task.length} символов</span>
               <button className="reset-button" type="button" onClick={handleReset} disabled={!config || isLoading}>
@@ -199,7 +184,6 @@ export default function App() {
             id="task"
             value={task}
             onChange={(event) => setTask(event.target.value)}
-            placeholder="Введите логическую, алгоритмическую или аналитическую задачу"
             rows={5}
             disabled={!config || isLoading}
           />
@@ -224,44 +208,21 @@ export default function App() {
           </div>
           <div className="result-grid">
             <ResultCard
-              title="Базовый вариант"
-              subtitle="Короткое решение"
-              result={comparison?.direct}
-              variant="direct"
+              title="temperature = 0"
+              result={comparison?.temperatureZero}
+              variant="strict"
             />
             <ResultCard
-              title="С рассуждением"
-              subtitle="Разбор по шагам"
-              result={comparison?.stepByStep}
-              variant="steps"
+              title="temperature = 0.7"
+              result={comparison?.temperatureBalanced}
+              variant="balanced"
             />
             <ResultCard
-              title="Уточнённый запрос"
-              subtitle="Решение после переформулировки"
-              result={comparison?.generatedPrompt}
-              variant="prompt"
-              extra={comparison?.generatedPrompt.generatedPrompt}
-            />
-            <ResultCard
-              title="Экспертная проверка"
-              subtitle="Несколько точек зрения"
-              result={comparison?.experts}
-              variant="experts"
+              title="temperature = 1.2"
+              result={comparison?.temperatureHigh}
+              variant="creative"
             />
           </div>
-
-          <article className="comparison-card">
-            <header className="card-header">
-              <div>
-                <h3>Итог</h3>
-                <p>Отличия и самый точный вариант</p>
-              </div>
-              {comparison && <span className="result-status">готово</span>}
-            </header>
-            <div className={`answer ${comparison ? '' : 'answer-empty'}`}>
-              {comparison ? comparison.comparison.answer : 'Вывод появится здесь'}
-            </div>
-          </article>
         </section>
       </div>
     </main>

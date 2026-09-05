@@ -52,16 +52,13 @@ type CompletionResult = {
 
 type MethodResult = CompletionResult & {
   prompt: string;
+  temperature: number;
 };
 
 type CompareResponse = {
-  direct: MethodResult;
-  stepByStep: MethodResult;
-  generatedPrompt: MethodResult & {
-    generatedPrompt: string;
-  };
-  experts: MethodResult;
-  comparison: CompletionResult;
+  temperatureZero: MethodResult;
+  temperatureBalanced: MethodResult;
+  temperatureHigh: MethodResult;
 };
 
 type CompareRequest = {
@@ -81,7 +78,7 @@ function readCompareRequest(body: unknown): CompareRequest | string {
 
 async function requestCompletion(
   messages: Array<{ role: 'user'; content: string }>,
-  options?: { maxTokens?: number }
+  options?: { temperature?: number }
 ): Promise<CompletionResult> {
   const deepseekResponse = await fetch('https://api.deepseek.com/chat/completions', {
     method: 'POST',
@@ -93,7 +90,7 @@ async function requestCompletion(
       model: appConfig.model,
       messages,
       thinking: { type: 'disabled' },
-      ...(options?.maxTokens ? { max_tokens: options.maxTokens } : {})
+      ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {})
     })
   });
 
@@ -139,73 +136,45 @@ app.post('/api/compare', async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'DEEPSEEK_API_KEY is not configured.' });
   }
 
-  const directPrompt = request.task;
-  const stepByStepPrompt = `${request.task}\n\nРешай пошагово.`;
-  const promptBuilderPrompt = [
-    'Составь один точный промпт для решения задачи ниже.',
-    'Промпт должен требовать краткое, проверяемое решение и итоговый ответ.',
-    'Верни только сам промпт без пояснений.',
-    '',
-    `Задача: ${request.task}`
-  ].join('\n');
-  const expertsPrompt = [
-    request.task,
-    '',
-    'Создай группу экспертов: аналитик, инженер и критик.',
-    'Пусть каждый эксперт даст своё решение или проверку.',
-    'В конце дай общий финальный ответ.'
-  ].join('\n');
+  const sharedPrompt = request.task;
+  const temperatures = {
+    temperatureZero: 0,
+    temperatureBalanced: 0.7,
+    temperatureHigh: 1.2
+  } as const;
 
   try {
-    const [directCompletion, stepByStepCompletion, generatedPromptCompletion, expertsCompletion] = await Promise.all([
-      requestCompletion([{ role: 'user', content: directPrompt }], { maxTokens: 600 }),
-      requestCompletion([{ role: 'user', content: stepByStepPrompt }], { maxTokens: 900 }),
-      requestCompletion([{ role: 'user', content: promptBuilderPrompt }], { maxTokens: 300 }),
-      requestCompletion([{ role: 'user', content: expertsPrompt }], { maxTokens: 1000 })
+    const [temperatureZeroCompletion, temperatureBalancedCompletion, temperatureHighCompletion] = await Promise.all([
+      requestCompletion([{ role: 'user', content: sharedPrompt }], {
+        temperature: temperatures.temperatureZero
+      }),
+      requestCompletion([{ role: 'user', content: sharedPrompt }], {
+        temperature: temperatures.temperatureBalanced
+      }),
+      requestCompletion([{ role: 'user', content: sharedPrompt }], {
+        temperature: temperatures.temperatureHigh
+      })
     ]);
-    const improvedPrompt = generatedPromptCompletion.answer.trim();
-    const generatedPromptSolution = await requestCompletion([{ role: 'user', content: improvedPrompt }], {
-      maxTokens: 900
-    });
 
-    const response: Omit<CompareResponse, 'comparison'> = {
-      direct: {
-        ...directCompletion,
-        prompt: directPrompt
+    const response: CompareResponse = {
+      temperatureZero: {
+        ...temperatureZeroCompletion,
+        prompt: sharedPrompt,
+        temperature: temperatures.temperatureZero
       },
-      stepByStep: {
-        ...stepByStepCompletion,
-        prompt: stepByStepPrompt
+      temperatureBalanced: {
+        ...temperatureBalancedCompletion,
+        prompt: sharedPrompt,
+        temperature: temperatures.temperatureBalanced
       },
-      generatedPrompt: {
-        ...generatedPromptSolution,
-        prompt: promptBuilderPrompt,
-        generatedPrompt: improvedPrompt
-      },
-      experts: {
-        ...expertsCompletion,
-        prompt: expertsPrompt
+      temperatureHigh: {
+        ...temperatureHighCompletion,
+        prompt: sharedPrompt,
+        temperature: temperatures.temperatureHigh
       }
     };
 
-    const comparisonPrompt = [
-      'Сравни четыре ответа на одну задачу.',
-      'Нужно кратко указать: отличаются ли ответы, есть ли ошибки, какой способ дал наиболее точный результат.',
-      'Ответ дай на русском языке в 3-5 предложениях.',
-      '',
-      `Задача: ${request.task}`,
-      '',
-      `1. Прямой ответ:\n${response.direct.answer}`,
-      '',
-      `2. Решай пошагово:\n${response.stepByStep.answer}`,
-      '',
-      `3. Сначала составлен промпт, затем получено решение:\n${response.generatedPrompt.answer}`,
-      '',
-      `4. Группа экспертов:\n${response.experts.answer}`
-    ].join('\n');
-    const comparison = await requestCompletion([{ role: 'user', content: comparisonPrompt }], { maxTokens: 500 });
-
-    return res.json({ ...response, comparison });
+    return res.json(response);
   } catch (error) {
     console.error(error);
     return res.status(502).json({

@@ -101,18 +101,8 @@ h1 {
   line-height: 1;
 }
 
-.hero > p {
-  max-width: 330px;
-  margin: 0 0 3px;
-  color: #71808a;
-  font-size: 13px;
-  line-height: 1.45;
-  text-align: right;
-}
-
 .request-card,
-.result-card,
-.comparison-card {
+.result-card {
   border: 1px solid #d2dce1;
   border-radius: 8px;
   background: #ffffff;
@@ -276,38 +266,27 @@ textarea:disabled {
   gap: 16px;
 }
 
-.result-card,
-.comparison-card {
+.result-card {
   min-width: 0;
   overflow: hidden;
 }
 
-.result-card.direct {
+.result-card.strict {
   border-top: 3px solid #7e8d97;
 }
 
-.result-card.steps {
+.result-card.balanced {
   border-top: 3px solid #2d806f;
 }
 
-.result-card.prompt {
+.result-card.creative {
   border-top: 3px solid #b66b33;
-}
-
-.result-card.experts {
-  border-top: 3px solid #596c9f;
-}
-
-.comparison-card {
-  margin-top: 16px;
-  border-top: 3px solid #bc513f;
 }
 
 .card-header {
   display: flex;
   align-items: start;
   gap: 11px;
-  min-height: 74px;
   padding: 15px 16px 12px;
 }
 
@@ -373,6 +352,7 @@ textarea:disabled {
 
 .card-meta {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 12px;
   border-top: 1px solid #e2e8eb;
@@ -389,11 +369,6 @@ textarea:disabled {
   .hero {
     display: block;
     padding: 25px 0 18px;
-  }
-
-  .hero > p {
-    margin-top: 8px;
-    text-align: left;
   }
 
   .result-grid {
