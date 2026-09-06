@@ -110,6 +110,37 @@ h1 {
   text-align: right;
 }
 
+.config-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.config-summary div {
+  min-width: 0;
+  border: 1px solid #d2dce1;
+  border-radius: 8px;
+  padding: 11px 12px;
+  background: #ffffff;
+}
+
+.config-summary span {
+  display: block;
+  margin-bottom: 4px;
+  color: #87949c;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.config-summary strong {
+  display: block;
+  color: #253540;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .request-card,
 .result-card,
 .comparison-card {
@@ -272,7 +303,7 @@ textarea:disabled {
 
 .result-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -282,16 +313,16 @@ textarea:disabled {
   overflow: hidden;
 }
 
-.result-card.strict {
-  border-top: 3px solid #7e8d97;
-}
-
-.result-card.balanced {
+.result-card.flash {
   border-top: 3px solid #2d806f;
 }
 
-.result-card.creative {
-  border-top: 3px solid #b66b33;
+.result-card.pro {
+  border-top: 3px solid #bc513f;
+}
+
+.result-card.gemini {
+  border-top: 3px solid #7e8d97;
 }
 
 .comparison-card {
@@ -370,12 +401,21 @@ textarea:disabled {
 .card-meta {
   display: flex;
   flex-wrap: wrap;
-  justify-content: space-between;
   gap: 12px;
   border-top: 1px solid #e2e8eb;
   padding: 10px 16px;
   color: #87949c;
   font-size: 10px;
+}
+
+.card-meta a {
+  color: #2d806f;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.card-meta a:hover {
+  text-decoration: underline;
 }
 
 @media (max-width: 760px) {
@@ -394,6 +434,10 @@ textarea:disabled {
   }
 
   .result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .config-summary {
     grid-template-columns: 1fr;
   }
 

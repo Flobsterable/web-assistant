@@ -2,28 +2,50 @@ import { FormEvent, useEffect, useState } from 'react';
 
 type CompletionResult = {
   answer: string;
-  completionTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  tokenSource: 'api' | 'estimated';
+  cost: number | null;
+  priceCurrency: string;
+  elapsedMs: number;
   finishReason: string | null;
 };
 
-type MethodResult = CompletionResult & {
-  prompt: string;
-  temperature: number;
+type ModelResult = CompletionResult & {
+  id: string;
+  provider: 'openai-compatible' | 'gemini';
+  title: string;
+  model: string;
+  sourceUrl: string | null;
+  inputPricePerMillion: number | null;
+  outputPricePerMillion: number | null;
+};
+
+type PublicModelConfig = {
+  id: string;
+  provider: 'openai-compatible' | 'gemini';
+  title: string;
+  baseUrl: string;
+  model: string;
+  sourceUrl: string | null;
+  inputPricePerMillion: number | null;
+  outputPricePerMillion: number | null;
+  priceCurrency: string;
 };
 
 type ComparisonResponse = {
-  temperatureZero: MethodResult;
-  temperatureBalanced: MethodResult;
-  temperatureHigh: MethodResult;
+  models: ModelResult[];
   comparison: CompletionResult;
 };
 
 type AppConfig = {
-  model: string;
   defaults: {
     task: string;
   };
+  models: PublicModelConfig[];
   hasApiKey: boolean;
+  error?: string;
 };
 
 function getFinishLabel(finishReason: string | null) {
@@ -32,23 +54,28 @@ function getFinishLabel(finishReason: string | null) {
   return finishReason || 'не указан';
 }
 
-function ResultCard({
-  title,
-  subtitle,
-  result,
-  variant
-}: {
-  title: string;
-  subtitle: string;
-  result?: MethodResult;
-  variant: 'strict' | 'balanced' | 'creative';
-}) {
+function formatDuration(ms: number) {
+  if (ms < 1000) return `${ms} мс`;
+  return `${(ms / 1000).toFixed(2)} с`;
+}
+
+function formatCost(cost: number | null, currency: string) {
+  if (cost === null) return 'не указана';
+  if (cost === 0) return `0 ${currency}`;
+  return `${cost.toFixed(6)} ${currency}`;
+}
+
+function formatPrice(price: number | null, currency: string) {
+  return price === null ? '-' : `${price} ${currency}/1M`;
+}
+
+function ResultCard({ result }: { result?: ModelResult }) {
   return (
-    <article className={`result-card ${variant}`}>
+    <article className={`result-card ${result?.id ?? ''}`}>
       <header className="card-header">
         <div>
-          <h3>{title}</h3>
-          <p>{subtitle}</p>
+          <h3>{result?.title ?? 'Модель'}</h3>
+          <p>{result ? result.model : 'Ожидает запуска'}</p>
         </div>
         {result && <span className="result-status">готово</span>}
       </header>
@@ -59,12 +86,54 @@ function ResultCard({
 
       {result && (
         <footer className="card-meta">
-          <span>temperature = {result.temperature}</span>
-          <span>{result.completionTokens ?? '-'} токенов</span>
+          <span>время: {formatDuration(result.elapsedMs)}</span>
+          <span>input: {result.inputTokens ?? '-'}</span>
+          <span>output: {result.outputTokens ?? '-'}</span>
+          <span>total: {result.totalTokens ?? '-'}</span>
+          <span>токены: {result.tokenSource === 'api' ? 'API' : 'оценка'}</span>
+          <span>стоимость: {formatCost(result.cost, result.priceCurrency)}</span>
+          <span>
+            цена in/out: {formatPrice(result.inputPricePerMillion, result.priceCurrency)} /{' '}
+            {formatPrice(result.outputPricePerMillion, result.priceCurrency)}
+          </span>
           <span>{getFinishLabel(result.finishReason)}</span>
+          {result.sourceUrl && (
+            <a href={result.sourceUrl} target="_blank" rel="noreferrer">
+              ссылка
+            </a>
+          )}
         </footer>
       )}
     </article>
+  );
+}
+
+function PlaceholderCard({ model }: { model: PublicModelConfig }) {
+  return (
+    <article className={`result-card ${model.id}`}>
+      <header className="card-header">
+        <div>
+          <h3>{model.title}</h3>
+          <p>{model.model}</p>
+        </div>
+      </header>
+      <div className="answer answer-empty">Ответ появится здесь</div>
+    </article>
+  );
+}
+
+function ConfigSummary({ config }: { config?: AppConfig }) {
+  if (!config?.models.length) return null;
+
+  return (
+    <div className="config-summary" aria-label="Подключенные модели">
+      {config.models.map((model) => (
+        <div key={model.id}>
+          <span>{model.title}</span>
+          <strong>{model.model}</strong>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -82,17 +151,17 @@ export default function App() {
     async function loadConfig() {
       try {
         const response = await fetch('/api/config', { signal: controller.signal });
-        const data = (await response.json()) as AppConfig | { error?: string };
+        const data = (await response.json()) as AppConfig;
 
-        if (!response.ok || !('defaults' in data)) {
+        if (!response.ok) {
           throw new Error('Не удалось загрузить конфигурацию.');
         }
 
         setConfig(data);
         setTask(data.defaults.task);
 
-        if (!data.hasApiKey) {
-          setConfigError('Добавьте DEEPSEEK_API_KEY в файл .env.');
+        if (data.error) {
+          setConfigError(`Заполните .env: ${data.error}`);
         }
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return;
@@ -115,15 +184,15 @@ export default function App() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!config) {
-      setError('Конфигурация приложения ещё не загружена.');
+    if (!config?.models.length) {
+      setError('Конфигурация моделей ещё не загружена.');
       return;
     }
 
     const trimmedTask = task.trim();
 
     if (!trimmedTask) {
-      setError('Введите задачу.');
+      setError('Введите запрос.');
       return;
     }
 
@@ -161,23 +230,24 @@ export default function App() {
       <div className="app-frame">
         <header className="topbar">
           <div className="brand-lockup">
-            <h1>Сравнение temperature</h1>
+            <h1>Сравнение LLM</h1>
           </div>
-          <span className={`api-status ${config ? 'ready' : 'pending'}`}>
-            <span className="status-dot" /> {config ? config.model : 'Подключение...'}
+          <span className={`api-status ${config?.models.length ? 'ready' : 'pending'}`}>
+            <span className="status-dot" /> {config?.models.length ? `${config.models.length} модели подключены` : 'Подключение...'}
           </span>
         </header>
 
         <section className="hero">
           <div>
-            <h2>Один запрос, три температуры</h2>
+            <h2>Один запрос, три модели</h2>
           </div>
-          <p>Введите задачу и сравните точность, креативность и разнообразие ответов.</p>
         </section>
+
+        <ConfigSummary config={config} />
 
         <form className="request-card" onSubmit={handleSubmit}>
           <div className="request-header">
-            <label htmlFor="task">Задача</label>
+            <label htmlFor="task">Запрос</label>
             <div className="request-tools">
               <span>{task.length} символов</span>
               <button className="reset-button" type="button" onClick={handleReset} disabled={!config || isLoading}>
@@ -189,7 +259,7 @@ export default function App() {
             id="task"
             value={task}
             onChange={(event) => setTask(event.target.value)}
-            placeholder="Введите логическую, алгоритмическую или аналитическую задачу"
+            placeholder="Введите один запрос для всех моделей"
             rows={5}
             disabled={!config || isLoading}
           />
@@ -200,8 +270,8 @@ export default function App() {
                 {configError || error}
               </p>
             )}
-            <button className="submit-button" type="submit" disabled={!config || Boolean(configError) || isLoading}>
-              {!config ? 'Загрузка настроек...' : isLoading ? 'Загрузка...' : 'Сравнить'}
+            <button className="submit-button" type="submit" disabled={!config?.models.length || Boolean(configError) || isLoading}>
+              {!config ? 'Загрузка настроек...' : isLoading ? 'Запросы выполняются...' : 'Сравнить'}
               {!isLoading && <span aria-hidden="true">→</span>}
             </button>
           </div>
@@ -210,34 +280,19 @@ export default function App() {
         <section className="results" aria-live="polite">
           <div className="results-header">
             <h2>Результаты</h2>
-            {isLoading && <span className="loading-note">API-запросы выполняются</span>}
+            {isLoading && <span className="loading-note">API-запросы выполняются параллельно</span>}
           </div>
           <div className="result-grid">
-            <ResultCard
-              title="temperature = 0"
-              subtitle="Максимально стабильный ответ"
-              result={comparison?.temperatureZero}
-              variant="strict"
-            />
-            <ResultCard
-              title="temperature = 0.7"
-              subtitle="Баланс точности и вариативности"
-              result={comparison?.temperatureBalanced}
-              variant="balanced"
-            />
-            <ResultCard
-              title="temperature = 1.2"
-              subtitle="Больше идей и неожиданных формулировок"
-              result={comparison?.temperatureHigh}
-              variant="creative"
-            />
+            {comparison
+              ? comparison.models.map((model) => <ResultCard key={model.id} result={model} />)
+              : config?.models.map((model) => <PlaceholderCard key={model.id} model={model} />)}
           </div>
 
           <article className="comparison-card">
             <header className="card-header">
               <div>
-                <h3>Выводы</h3>
-                <p>Точность, креативность, разнообразие и подходящие задачи</p>
+                <h3>Короткий вывод</h3>
+                <p>Качество ответов, скорость, токены, стоимость и ресурсоёмкость</p>
               </div>
               {comparison && <span className="result-status">готово</span>}
             </header>
