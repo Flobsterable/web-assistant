@@ -42,8 +42,7 @@ textarea {
 }
 
 .brand-lockup {
-  display: flex;
-  align-items: center;
+  min-width: 0;
 }
 
 h1,
@@ -57,6 +56,12 @@ h1 {
   margin: 3px 0 0;
   font-size: 19px;
   line-height: 1.1;
+}
+
+.brand-lockup p {
+  margin: 5px 0 0;
+  color: #71808a;
+  font-size: 12px;
 }
 
 .api-status {
@@ -101,13 +106,12 @@ h1 {
   line-height: 1;
 }
 
-.hero > p {
-  max-width: 330px;
-  margin: 0 0 3px;
+.hero p {
+  max-width: 680px;
+  margin: 12px 0 0;
   color: #71808a;
-  font-size: 13px;
-  line-height: 1.45;
-  text-align: right;
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 .config-summary {
@@ -143,7 +147,8 @@ h1 {
 
 .request-card,
 .result-card,
-.comparison-card {
+.comparison-card,
+.chat-panel {
   border: 1px solid #d2dce1;
   border-radius: 8px;
   background: #ffffff;
@@ -151,7 +156,74 @@ h1 {
 }
 
 .request-card {
+  margin-top: 16px;
   padding: 20px;
+}
+
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 320px;
+  padding: 16px;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 286px;
+  place-items: center;
+  color: #9aa6ad;
+  font-size: 13px;
+  text-align: center;
+}
+
+.message {
+  width: min(760px, 100%);
+  border: 1px solid #dbe3e7;
+  border-radius: 8px;
+  padding: 13px 14px;
+  background: #fbfcfc;
+}
+
+.message.user {
+  align-self: flex-end;
+  border-color: #c7dcd5;
+  background: #f2faf7;
+}
+
+.message.agent {
+  align-self: flex-start;
+}
+
+.message-label {
+  margin-bottom: 6px;
+  color: #697781;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.message-body {
+  color: #253540;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message-body.muted {
+  color: #8c99a1;
+}
+
+.message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+  border-top: 1px solid #e2e8eb;
+  padding-top: 10px;
+  color: #87949c;
+  font-size: 10px;
 }
 
 .request-header {
@@ -428,7 +500,7 @@ textarea:disabled {
     padding: 25px 0 18px;
   }
 
-  .hero > p {
+  .hero p {
     margin-top: 8px;
     text-align: left;
   }

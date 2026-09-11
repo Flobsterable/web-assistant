@@ -4,6 +4,7 @@ import express, { Request, Response } from 'express';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
+import { SimpleAgent } from './agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -95,6 +96,10 @@ type CompareRequest = {
   task: string;
 };
 
+type AgentRequest = {
+  message: string;
+};
+
 const modelEnvPrefixes = ['MODEL_GEMINI', 'MODEL_FLASH', 'MODEL_PRO'] as const;
 
 function readOptionalTextEnv(name: string) {
@@ -173,6 +178,10 @@ function readModelConfigs() {
   ];
 }
 
+function readAgentModelConfig() {
+  return readModelConfig('MODEL_FLASH', 'DeepSeek V4 Flash', 'openai-compatible');
+}
+
 const defaultTask =
   readOptionalTextEnv('DEFAULT_TASK') ??
   'Объясни простыми словами, что такое градиентный бустинг, и приведи один пример применения.';
@@ -189,6 +198,17 @@ function readCompareRequest(body: unknown): CompareRequest | string {
   if (!task) return 'Task is required.';
 
   return { task };
+}
+
+function readAgentRequest(body: unknown): AgentRequest | string {
+  if (!body || typeof body !== 'object') return 'Request body is required.';
+
+  const candidate = body as Record<string, unknown>;
+  const message = typeof candidate.message === 'string' ? candidate.message.trim() : '';
+
+  if (!message) return 'Message is required.';
+
+  return { message };
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -372,12 +392,12 @@ function toPublicModelConfig(config: ModelConfig) {
 
 app.get('/api/config', (_req: Request, res: Response) => {
   try {
-    const models = readModelConfigs();
+    const agentModel = readAgentModelConfig();
 
     return res.json({
       defaults: { task: defaultTask },
-      models: models.map(toPublicModelConfig),
-      hasApiKey: models.every((model) => Boolean(model.apiKey))
+      models: [toPublicModelConfig(agentModel)],
+      hasApiKey: Boolean(agentModel.apiKey)
     });
   } catch (error) {
     return res.json({
@@ -447,6 +467,44 @@ app.post('/api/compare', async (req: Request, res: Response) => {
     );
 
     const result: CompareResponse = { models, comparison };
+    return res.json(result);
+  } catch (error) {
+    console.error(error);
+    return res.status(502).json({
+      error: error instanceof Error ? error.message : 'Failed to contact model API.'
+    });
+  }
+});
+
+app.post('/api/agent', async (req: Request, res: Response) => {
+  const request = readAgentRequest(req.body);
+
+  if (typeof request === 'string') {
+    return res.status(400).json({ error: request });
+  }
+
+  let agentModel: ModelConfig;
+  try {
+    agentModel = readAgentModelConfig();
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+    });
+  }
+
+  const agent = new SimpleAgent({
+    name: 'Simple LLM Agent',
+    provider: 'DeepSeek',
+    systemPrompt:
+      'Ты простой LLM-агент. Отвечай на русском языке, полезно и по делу. Если запрос неполный, аккуратно уточни недостающие детали.',
+    temperature: 0.2,
+    modelTitle: agentModel.title,
+    model: agentModel.model,
+    complete: (messages, options) => requestCompletion(agentModel, messages, options)
+  });
+
+  try {
+    const result = await agent.run(request.message);
     return res.json(result);
   } catch (error) {
     console.error(error);
