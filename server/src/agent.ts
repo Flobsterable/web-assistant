@@ -1,5 +1,11 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type { AgentTokenReport, TokenBudget, TokenPricing } from './token-meter.js';
+import {
+  createTokenReport,
+  estimateMessageTokens,
+  normalizeTokenBudget
+} from './token-meter.js';
 
 export type AgentMessage = {
   role: 'system' | 'user' | 'assistant';
@@ -19,6 +25,7 @@ export type AgentCompletionResult = {
   outputTokens: number | null;
   totalTokens: number | null;
   tokenSource: 'api' | 'estimated';
+  tokenReport?: AgentTokenReport;
   cost: number | null;
   priceCurrency: string;
   elapsedMs: number;
@@ -31,6 +38,16 @@ export type AgentRunResult = AgentCompletionResult & {
   modelTitle: string;
   model: string;
 };
+
+export class AgentContextOverflowError extends Error {
+  constructor(
+    message: string,
+    readonly tokenReport: AgentTokenReport
+  ) {
+    super(message);
+    this.name = 'AgentContextOverflowError';
+  }
+}
 
 type CompletionClient = (messages: AgentMessage[], options?: { temperature?: number }) => Promise<AgentCompletionResult>;
 
@@ -49,6 +66,8 @@ type SimpleAgentOptions = {
   model: string;
   complete: CompletionClient;
   conversationStore: ConversationStore;
+  tokenPricing: TokenPricing;
+  tokenBudget?: Partial<TokenBudget>;
   maxContextMessages?: number;
   maxContextCharacters?: number;
 };
@@ -162,6 +181,8 @@ export class SimpleAgent {
   private readonly model: string;
   private readonly complete: CompletionClient;
   private readonly conversationStore: ConversationStore;
+  private readonly tokenPricing: TokenPricing;
+  private readonly tokenBudget?: Partial<TokenBudget>;
   private readonly maxContextMessages: number;
   private readonly maxContextCharacters: number;
 
@@ -174,6 +195,8 @@ export class SimpleAgent {
     this.model = options.model;
     this.complete = options.complete;
     this.conversationStore = options.conversationStore;
+    this.tokenPricing = options.tokenPricing;
+    this.tokenBudget = options.tokenBudget;
     this.maxContextMessages = normalizePositiveInteger(options.maxContextMessages, 40);
     this.maxContextCharacters = normalizePositiveInteger(options.maxContextCharacters, 24_000);
   }
@@ -193,7 +216,23 @@ export class SimpleAgent {
       throw new Error('User request is required.');
     }
 
-    const contextMessages = this.selectMessagesForContext(await this.conversationStore.load(), normalizedRequest);
+    const fullHistory = await this.conversationStore.load();
+    const contextMessages = this.selectMessagesForContext(fullHistory, normalizedRequest);
+    const initialTokenReport = createTokenReport({
+      systemPrompt: this.systemPrompt,
+      selectedHistory: contextMessages,
+      fullHistory,
+      currentRequest: normalizedRequest,
+      pricing: this.tokenPricing,
+      budget: this.tokenBudget
+    });
+
+    if (initialTokenReport.willOverflow) {
+      throw new AgentContextOverflowError(
+        `Запрос не помещается в контекст модели: превышение ${initialTokenReport.overflowTokens} токенов. Сократите запрос или увеличьте MODEL_MAX_CONTEXT_TOKENS.`,
+        initialTokenReport
+      );
+    }
 
     const completion = await this.complete(
       [
@@ -226,6 +265,19 @@ export class SimpleAgent {
 
     return {
       ...completion,
+      tokenReport: createTokenReport({
+        systemPrompt: this.systemPrompt,
+        selectedHistory: contextMessages,
+        fullHistory,
+        currentRequest: normalizedRequest,
+        outputText: completion.answer,
+        apiInputTokens: completion.inputTokens,
+        apiOutputTokens: completion.outputTokens,
+        apiTotalTokens: completion.totalTokens,
+        tokenSource: completion.tokenSource,
+        pricing: this.tokenPricing,
+        budget: this.tokenBudget
+      }),
       agentName: this.name,
       agentProvider: this.provider,
       modelTitle: this.modelTitle,
@@ -233,18 +285,45 @@ export class SimpleAgent {
     };
   }
 
+  async inspectNextRun(userRequest: string) {
+    const normalizedRequest = userRequest.trim();
+
+    if (!normalizedRequest) {
+      throw new Error('User request is required.');
+    }
+
+    const fullHistory = await this.conversationStore.load();
+    const contextMessages = this.selectMessagesForContext(fullHistory, normalizedRequest);
+
+    return createTokenReport({
+      systemPrompt: this.systemPrompt,
+      selectedHistory: contextMessages,
+      fullHistory,
+      currentRequest: normalizedRequest,
+      pricing: this.tokenPricing,
+      budget: this.tokenBudget
+    });
+  }
+
   private selectMessagesForContext(history: StoredAgentMessage[], nextUserMessage: string) {
     const recentMessages = history.slice(-this.maxContextMessages);
     const selectedMessages: StoredAgentMessage[] = [];
     let characterCount = nextUserMessage.length;
+    const tokenBudget = normalizeTokenBudget(this.tokenBudget);
+    const maxInputTokens = Math.max(0, tokenBudget.maxContextTokens - tokenBudget.reservedOutputTokens);
+    let tokenCount =
+      estimateMessageTokens({ role: 'system', content: this.systemPrompt }) +
+      estimateMessageTokens({ role: 'user', content: nextUserMessage });
 
     for (const message of [...recentMessages].reverse()) {
       const nextCharacterCount = characterCount + message.content.length;
+      const nextTokenCount = tokenCount + estimateMessageTokens({ role: message.role, content: message.content });
 
-      if (selectedMessages.length > 0 && nextCharacterCount > this.maxContextCharacters) break;
+      if (nextTokenCount > maxInputTokens || (selectedMessages.length > 0 && nextCharacterCount > this.maxContextCharacters)) break;
 
       selectedMessages.unshift(message);
       characterCount = nextCharacterCount;
+      tokenCount = nextTokenCount;
     }
 
     return selectedMessages;
