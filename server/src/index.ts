@@ -4,7 +4,7 @@ import express, { Request, Response } from 'express';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import { SimpleAgent } from './agent.js';
+import { AgentMessage, JsonConversationStore, SimpleAgent } from './agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -100,6 +100,13 @@ type AgentRequest = {
   message: string;
 };
 
+type PublicAgentMessage = {
+  id: string;
+  role: 'user' | 'agent';
+  content: string;
+  createdAt: string;
+};
+
 const modelEnvPrefixes = ['MODEL_GEMINI', 'MODEL_FLASH', 'MODEL_PRO'] as const;
 
 function readOptionalTextEnv(name: string) {
@@ -185,6 +192,8 @@ function readAgentModelConfig() {
 const defaultTask =
   readOptionalTextEnv('DEFAULT_TASK') ??
   'Объясни простыми словами, что такое градиентный бустинг, и приведи один пример применения.';
+const agentHistoryPath = path.resolve(__dirname, '../data/agent-history.json');
+const agentConversationStore = new JsonConversationStore(agentHistoryPath);
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
@@ -240,7 +249,7 @@ function calculateCost(
 
 async function requestCompletion(
   config: ModelConfig,
-  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  messages: AgentMessage[],
   options?: { temperature?: number }
 ): Promise<CompletionResult> {
   if (config.provider === 'gemini') {
@@ -252,7 +261,7 @@ async function requestCompletion(
 
 async function requestOpenAiCompatibleCompletion(
   config: ModelConfig,
-  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  messages: AgentMessage[],
   options?: { temperature?: number }
 ): Promise<CompletionResult> {
   const startedAt = performance.now();
@@ -307,10 +316,10 @@ async function requestOpenAiCompatibleCompletion(
 
 async function requestGeminiCompletion(
   config: ModelConfig,
-  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  messages: AgentMessage[],
   options?: { temperature?: number }
 ): Promise<CompletionResult> {
-  const text = messages.map((message) => `${message.role === 'system' ? 'System' : 'User'}: ${message.content}`).join('\n\n');
+  const text = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : message.role === 'system' ? 'System' : 'User'}: ${message.content}`).join('\n\n');
   const startedAt = performance.now();
   const response = await fetch(`${config.baseUrl}/models/${config.model}:generateContent?key=${config.apiKey}`, {
     method: 'POST',
@@ -390,6 +399,31 @@ function toPublicModelConfig(config: ModelConfig) {
   };
 }
 
+function toPublicAgentMessage(message: Awaited<ReturnType<SimpleAgent['history']>>[number]): PublicAgentMessage {
+  return {
+    id: message.id,
+    role: message.role === 'assistant' ? 'agent' : 'user',
+    content: message.content,
+    createdAt: message.createdAt
+  };
+}
+
+function createAgent(agentModel: ModelConfig) {
+  return new SimpleAgent({
+    name: 'Simple LLM Agent',
+    provider: 'DeepSeek',
+    systemPrompt:
+      'Ты простой LLM-агент. Отвечай на русском языке, полезно и по делу. Если запрос неполный, аккуратно уточни недостающие детали.',
+    temperature: 0.2,
+    modelTitle: agentModel.title,
+    model: agentModel.model,
+    conversationStore: agentConversationStore,
+    maxContextMessages: readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? undefined,
+    maxContextCharacters: readOptionalNumberEnv('AGENT_MAX_CONTEXT_CHARACTERS') ?? undefined,
+    complete: (messages, options) => requestCompletion(agentModel, messages, options)
+  });
+}
+
 app.get('/api/config', (_req: Request, res: Response) => {
   try {
     const agentModel = readAgentModelConfig();
@@ -405,6 +439,50 @@ app.get('/api/config', (_req: Request, res: Response) => {
       models: [],
       hasApiKey: false,
       error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+    });
+  }
+});
+
+app.get('/api/agent/history', async (_req: Request, res: Response) => {
+  let agentModel: ModelConfig;
+  try {
+    agentModel = readAgentModelConfig();
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+    });
+  }
+
+  try {
+    const agent = createAgent(agentModel);
+    const history = await agent.history();
+    return res.json({ messages: history.map(toPublicAgentMessage) });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to load agent history.'
+    });
+  }
+});
+
+app.delete('/api/agent/history', async (_req: Request, res: Response) => {
+  let agentModel: ModelConfig;
+  try {
+    agentModel = readAgentModelConfig();
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+    });
+  }
+
+  try {
+    const agent = createAgent(agentModel);
+    await agent.clearHistory();
+    return res.status(204).send();
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to clear agent history.'
     });
   }
 });
@@ -492,16 +570,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     });
   }
 
-  const agent = new SimpleAgent({
-    name: 'Simple LLM Agent',
-    provider: 'DeepSeek',
-    systemPrompt:
-      'Ты простой LLM-агент. Отвечай на русском языке, полезно и по делу. Если запрос неполный, аккуратно уточни недостающие детали.',
-    temperature: 0.2,
-    modelTitle: agentModel.title,
-    model: agentModel.model,
-    complete: (messages, options) => requestCompletion(agentModel, messages, options)
-  });
+  const agent = createAgent(agentModel);
 
   try {
     const result = await agent.run(request.message);

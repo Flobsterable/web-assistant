@@ -40,7 +40,12 @@ type ChatMessage = {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  createdAt?: string;
   meta?: AgentResponse;
+};
+
+type AgentHistoryResponse = {
+  messages: ChatMessage[];
 };
 
 function formatDuration(ms: number) {
@@ -91,12 +96,15 @@ export default function App() {
   useEffect(() => {
     const controller = new AbortController();
 
-    async function loadConfig() {
+    async function loadInitialData() {
       try {
-        const response = await fetch('/api/config', { signal: controller.signal });
-        const data = (await response.json()) as AppConfig;
+        const [configResponse, historyResponse] = await Promise.all([
+          fetch('/api/config', { signal: controller.signal }),
+          fetch('/api/agent/history', { signal: controller.signal })
+        ]);
+        const data = (await configResponse.json()) as AppConfig;
 
-        if (!response.ok) {
+        if (!configResponse.ok) {
           throw new Error('Не удалось загрузить конфигурацию.');
         }
 
@@ -105,6 +113,9 @@ export default function App() {
 
         if (data.error) {
           setConfigError(`Заполните .env: ${data.error}`);
+        } else if (historyResponse.ok) {
+          const history = (await historyResponse.json()) as AgentHistoryResponse;
+          setMessages(history.messages);
         }
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return;
@@ -112,14 +123,25 @@ export default function App() {
       }
     }
 
-    void loadConfig();
+    void loadInitialData();
     return () => controller.abort();
   }, []);
 
-  function handleReset() {
+  async function handleReset() {
     setMessage(config?.defaults.task ?? '');
     setMessages([]);
     setError('');
+
+    try {
+      const response = await fetch('/api/agent/history', { method: 'DELETE' });
+
+      if (!response.ok) {
+        const data = (await response.json()) as { error?: string };
+        throw new Error(data.error ?? 'Не удалось очистить историю агента.');
+      }
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось очистить историю агента.');
+    }
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
