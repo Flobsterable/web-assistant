@@ -7,7 +7,7 @@ type AgentResponse = {
   totalTokens: number | null;
   tokenSource: 'api' | 'estimated';
   tokenReport?: AgentTokenReport;
-  compression?: CompressionReport;
+  contextManagement?: ContextManagementReport;
   cost: number | null;
   priceCurrency: string;
   elapsedMs: number;
@@ -79,6 +79,8 @@ type AgentChatsResponse = {
   chats: AgentChatSummary[];
 };
 
+type ContextStrategy = 'sliding-window' | 'sticky-facts' | 'branching';
+
 type RequestTokenMeta = {
   currentRequestTokens: number;
   fullHistoryTokens: number;
@@ -118,22 +120,46 @@ type AgentTokenReport = {
   priceCurrency: string;
 };
 
-type CompressionReport = {
-  enabled: boolean;
+type ContextManagementReport = {
+  strategy: ContextStrategy;
   keepLastMessages: number;
-  summaryBatchMessages: number;
   fullHistoryMessages: number;
   exactHistoryMessages: number;
-  summarizedMessages: number;
-  summaryCount: number;
   fullHistoryTokens: number;
-  compressedHistoryTokens: number;
+  selectedHistoryTokens: number;
+  factsTokens: number;
   uncompressedInputTokens: number;
-  compressedInputTokens: number;
+  managedInputTokens: number;
   savedInputTokens: number;
   savedInputPercent: number;
-  summarizationInputTokens: number;
-  summarizationOutputTokens: number;
+  facts: Record<string, string>;
+  branch?: {
+    checkpointMessageCount: number;
+    branchId: string;
+  };
+};
+
+type ContextDemoResult = {
+  strategy: ContextStrategy;
+  scenarioTurns: number;
+  keepLastMessages: number;
+  promptTokensTotal: number;
+  averageInputTokens: number;
+  retainedImportantDetails: number;
+  quality: string;
+  stability: string;
+  tokenSpend: string;
+  userConvenience: string;
+};
+
+type ContextDemoResponse = {
+  title: string;
+  results: ContextDemoResult[];
+};
+
+type BranchLink = {
+  label: string;
+  sessionId: string;
 };
 
 type HistoryTokenStats = {
@@ -169,6 +195,12 @@ function formatCost(cost: number | null, currency: string) {
 function formatTokens(value: number | null | undefined) {
   if (value === null || value === undefined) return '-';
   return new Intl.NumberFormat('ru-RU').format(value);
+}
+
+function strategyTitle(strategy: ContextStrategy) {
+  if (strategy === 'sticky-facts') return 'Sticky Facts';
+  if (strategy === 'branching') return 'Branching';
+  return 'Sliding Window';
 }
 
 function toRequestTokenMeta(tokenReport: AgentTokenReport): RequestTokenMeta {
@@ -218,14 +250,15 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           <span>стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
         </footer>
       )}
-      {message.meta?.compression && (
+      {message.meta?.contextManagement && (
         <footer className="message-meta compression-meta">
-          <span>сжатие: {message.meta.compression.enabled ? 'вкл' : 'выкл'}</span>
-          <span>summary: {formatTokens(message.meta.compression.summaryCount)}</span>
-          <span>как есть: {formatTokens(message.meta.compression.exactHistoryMessages)}</span>
-          <span>input без сжатия: {formatTokens(message.meta.compression.uncompressedInputTokens)}</span>
-          <span>input со сжатием: {formatTokens(message.meta.compression.compressedInputTokens)}</span>
-          <span>экономия: {formatTokens(message.meta.compression.savedInputTokens)} ({message.meta.compression.savedInputPercent}%)</span>
+          <span>стратегия: {strategyTitle(message.meta.contextManagement.strategy)}</span>
+          <span>последних: {formatTokens(message.meta.contextManagement.exactHistoryMessages)}</span>
+          <span>facts: {formatTokens(Object.keys(message.meta.contextManagement.facts).length)}</span>
+          <span>facts токены: {formatTokens(message.meta.contextManagement.factsTokens)}</span>
+          <span>input без управления: {formatTokens(message.meta.contextManagement.uncompressedInputTokens)}</span>
+          <span>managed input: {formatTokens(message.meta.contextManagement.managedInputTokens)}</span>
+          <span>экономия: {formatTokens(message.meta.contextManagement.savedInputTokens)} ({message.meta.contextManagement.savedInputPercent}%)</span>
         </footer>
       )}
       {message.responseMeta && !message.meta && (
@@ -260,6 +293,10 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [historyStats, setHistoryStats] = useState<HistoryTokenStats>();
+  const [contextStrategy, setContextStrategy] = useState<ContextStrategy>('sliding-window');
+  const [contextDemo, setContextDemo] = useState<ContextDemoResponse>();
+  const [branchLinks, setBranchLinks] = useState<BranchLink[]>([]);
+  const [branchCheckpoint, setBranchCheckpoint] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
@@ -271,10 +308,11 @@ export default function App() {
     async function loadInitialData() {
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
-        const [configResponse, chatsResponse, historyResponse] = await Promise.all([
+        const [configResponse, chatsResponse, historyResponse, demoResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
-          fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal })
+          fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
+          fetch('/api/agent/context-strategies/demo', { signal: controller.signal })
         ]);
         const data = (await configResponse.json()) as AppConfig;
 
@@ -308,6 +346,10 @@ export default function App() {
           setHistoryStats(history.stats);
         }
 
+        if (demoResponse.ok) {
+          setContextDemo((await demoResponse.json()) as ContextDemoResponse);
+        }
+
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return;
         setConfigError(caughtError instanceof Error ? caughtError.message : 'Не удалось загрузить конфигурацию.');
@@ -335,6 +377,8 @@ export default function App() {
   }
 
   function handleNewChat() {
+    setBranchLinks([]);
+    setBranchCheckpoint(null);
     openChat(createSessionId());
   }
 
@@ -365,6 +409,8 @@ export default function App() {
     setMessage(config?.defaults.task ?? '');
     setMessages([]);
     setHistoryStats(undefined);
+    setBranchLinks([]);
+    setBranchCheckpoint(null);
     setError('');
 
     try {
@@ -379,6 +425,44 @@ export default function App() {
       void refreshChats();
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Не удалось очистить историю агента.');
+    }
+  }
+
+  async function handleContextStrategyChange(nextStrategy: ContextStrategy) {
+    setContextStrategy(nextStrategy);
+
+    if (nextStrategy !== 'branching') return;
+    if (messages.length === 0 || branchLinks.length > 0) return;
+
+    await handleCreateBranches();
+  }
+
+  async function handleCreateBranches() {
+    setError('');
+
+    try {
+      const response = await fetch('/api/agent/branches', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          sessionId,
+          checkpointMessageCount: messages.length
+        })
+      });
+      const data = (await response.json()) as { branches?: BranchLink[]; checkpointMessageCount?: number; error?: string };
+
+      if (!response.ok || !data.branches?.length) {
+        throw new Error(data.error ?? 'Не удалось создать ветки.');
+      }
+
+      setBranchLinks(data.branches);
+      setBranchCheckpoint(data.checkpointMessageCount ?? messages.length);
+      await refreshChats();
+      openChat(data.branches[0].sessionId);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось создать ветки.');
     }
   }
 
@@ -412,7 +496,8 @@ export default function App() {
         },
         body: JSON.stringify({
           message: trimmedMessage,
-          sessionId
+          sessionId,
+          contextStrategy
         })
       });
 
@@ -546,6 +631,61 @@ export default function App() {
               )}
             </section>
           )}
+
+          <section className="context-controls" aria-label="Управление контекстом">
+            <div className="context-control-row">
+              <label htmlFor="context-strategy">Стратегия контекста</label>
+              <select
+                id="context-strategy"
+                value={contextStrategy}
+                onChange={(event) => void handleContextStrategyChange(event.target.value as ContextStrategy)}
+                disabled={isLoading}
+              >
+                <option value="sliding-window">Sliding Window</option>
+                <option value="sticky-facts">Sticky Facts / Key-Value Memory</option>
+                <option value="branching">Branching</option>
+              </select>
+              {contextStrategy === 'branching' && (
+                <button type="button" onClick={() => void handleCreateBranches()} disabled={isLoading || messages.length === 0}>
+                  Checkpoint + 2 ветки
+                </button>
+              )}
+            </div>
+
+            {contextStrategy === 'branching' && branchLinks.length > 0 && (
+              <div className="branch-switcher">
+                <span>Checkpoint: {formatTokens(branchCheckpoint)} сообщений</span>
+                <div>
+                  {branchLinks.map((branch) => (
+                    <button
+                      className={branch.sessionId === sessionId ? 'active' : ''}
+                      key={branch.sessionId}
+                      type="button"
+                      onClick={() => openChat(branch.sessionId)}
+                    >
+                      {branch.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {contextDemo && (
+              <div className="context-demo">
+                <div className="context-demo-title">{contextDemo.title}</div>
+                <div className="context-demo-grid">
+                  {contextDemo.results.map((result) => (
+                    <article className="context-demo-item" key={result.strategy}>
+                      <strong>{strategyTitle(result.strategy)}</strong>
+                      <span>Средний input: {formatTokens(result.averageInputTokens)}</span>
+                      <span>Детали: {result.retainedImportantDetails}/6</span>
+                      <p>{result.stability}</p>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
 
         <section className="chat-panel" aria-live="polite">
           {messages.length === 0 ? (

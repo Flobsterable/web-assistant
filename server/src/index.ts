@@ -6,7 +6,17 @@ import { readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import { AgentContextOverflowError, AgentMessage, JsonConversationStore, SimpleAgent } from './agent.js';
+import {
+  AgentContextOverflowError,
+  AgentMessage,
+  ContextStrategy,
+  ConversationFacts,
+  createFactMessages,
+  JsonConversationStore,
+  SimpleAgent,
+  StoredAgentMessage,
+  updateConversationFacts
+} from './agent.js';
 import {
   buildTokenDemo,
   calculateCost,
@@ -124,6 +134,7 @@ type CompareRequest = {
 type AgentRequest = {
   message: string;
   sessionId?: string;
+  contextStrategy?: ContextStrategy;
 };
 
 type PublicAgentMessage = {
@@ -145,6 +156,11 @@ type PublicAgentChat = PublicAgentWindow & {
   fullHistoryTokens: number;
   updatedAt: string | null;
   lastMessagePreview: string | null;
+};
+
+type BranchRequest = {
+  sessionId?: string;
+  checkpointMessageCount?: number;
 };
 
 type PublicRequestTokenMeta = {
@@ -355,10 +371,29 @@ function readAgentRequest(body: unknown): AgentRequest | string {
   const candidate = body as Record<string, unknown>;
   const message = typeof candidate.message === 'string' ? candidate.message.trim() : '';
   const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
+  const contextStrategy = normalizeContextStrategy(candidate.contextStrategy);
 
   if (!message) return 'Message is required.';
 
-  return { message, sessionId: normalizeSessionId(rawSessionId) };
+  return { message, sessionId: normalizeSessionId(rawSessionId), contextStrategy };
+}
+
+function readBranchRequest(body: unknown): BranchRequest | string {
+  if (!body || typeof body !== 'object') return 'Request body is required.';
+
+  const candidate = body as Record<string, unknown>;
+  const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
+  const checkpointMessageCount =
+    typeof candidate.checkpointMessageCount === 'number' && Number.isFinite(candidate.checkpointMessageCount)
+      ? Math.max(0, Math.floor(candidate.checkpointMessageCount))
+      : undefined;
+
+  return { sessionId: normalizeSessionId(rawSessionId), checkpointMessageCount };
+}
+
+function normalizeContextStrategy(value: unknown): ContextStrategy {
+  if (value === 'sticky-facts' || value === 'branching' || value === 'sliding-window') return value;
+  return 'sliding-window';
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -546,15 +581,19 @@ function readSessionIdFromRequest(req: Request) {
 
 function createSessionTitle(sessionId: string) {
   if (sessionId === defaultAgentSessionId) return 'Главное окно';
+  if (sessionId.includes('-ui-')) return `UI ветка ${sessionId.slice(-8)}`;
+  if (sessionId.includes('-api-')) return `API ветка ${sessionId.slice(-8)}`;
   return `Окно ${sessionId.slice(0, 8)}`;
 }
 
 function createChatTitle(history: Awaited<ReturnType<SimpleAgent['history']>>, sessionId: string) {
+  const branchPrefix = sessionId.includes('-ui-') ? 'UI ветка' : sessionId.includes('-api-') ? 'API ветка' : null;
   const firstUserMessage = history.find((message) => message.role === 'user');
   if (!firstUserMessage) return createSessionTitle(sessionId);
 
   const compactTitle = firstUserMessage.content.replace(/\s+/g, ' ').trim().slice(0, 42);
-  return compactTitle || createSessionTitle(sessionId);
+  const baseTitle = compactTitle || createSessionTitle(sessionId);
+  return branchPrefix ? `${branchPrefix} · ${baseTitle}` : baseTitle;
 }
 
 function createLastMessagePreview(history: Awaited<ReturnType<SimpleAgent['history']>>) {
@@ -683,6 +722,111 @@ function toPublicAgentMessages(history: Awaited<ReturnType<SimpleAgent['history'
   });
 }
 
+function buildContextStrategyComparison(params: { pricing: ReturnType<typeof createTokenPricing>; budget: ReturnType<typeof createTokenBudget> }) {
+  const keepLastMessages = readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5;
+  const scenario = [
+    'Цель: собрать ТЗ для веб-ассистента, который помогает менеджеру оформлять требования.',
+    'Важно: пользователь не технический, интерфейс должен быть простым и на русском.',
+    'Ограничение: без summary-сжатия, сравниваем только sliding window, facts и branching.',
+    'Решение: MVP должен хранить историю локально в JSON и показывать токены.',
+    'Предпочтение: ответы агента должны быть короткими, но не терять договорённости.',
+    'Добавляем требование: нужно поддержать несколько чатов и сброс истории.',
+    'Нужно предусмотреть ошибку переполнения контекста и понятное сообщение пользователю.',
+    'Договорились: facts хранят цель, ограничения, предпочтения, решения и фокус оценки.',
+    'Теперь нужна развилка: одна ветка проектирует UI, другая ветка проектирует API.',
+    'Ветка UI: хотим переключатель стратегий и видимый отчёт по токенам.',
+    'Ветка API: хотим endpoint для создания двух веток от checkpoint.',
+    'Финальный запрос: собери итоговое ТЗ с учётом всех важных деталей.'
+  ];
+  const assistantTurn =
+    'Принял. Фиксирую требование, уточняю риски и предлагаю следующий шаг реализации без добавления summary.';
+
+  return (['sliding-window', 'sticky-facts', 'branching'] as const).map((strategy) => {
+    const history: StoredAgentMessage[] = [];
+    let facts: ConversationFacts = {};
+    let promptTokensTotal = 0;
+    let retainedImportantDetails = 0;
+    const importantDetails = ['Цель', 'Важно', 'Ограничение', 'Решение', 'Предпочтение', 'Договорились'];
+
+    for (const [index, userMessage] of scenario.entries()) {
+      if (strategy === 'sticky-facts') {
+        facts = updateConversationFacts(facts, userMessage);
+      }
+
+      const recentHistory = history.slice(-keepLastMessages);
+      const factMessages = strategy === 'sticky-facts' ? createFactMessages(facts) : [];
+      const selectedHistory = [...factMessages, ...recentHistory.map((message) => ({ role: message.role, content: message.content }) as AgentMessage)];
+      const report = createTokenReport({
+        systemPrompt: agentDefinition.systemPrompt,
+        selectedHistory,
+        fullHistory: history,
+        currentRequest: userMessage,
+        outputText: assistantTurn,
+        pricing: params.pricing,
+        budget: params.budget
+      });
+
+      promptTokensTotal += report.inputTokens;
+      history.push(
+        createDemoStoredMessage('user', userMessage, index),
+        createDemoStoredMessage('assistant', assistantTurn, index)
+      );
+    }
+
+    const finalContextText =
+      strategy === 'sticky-facts'
+        ? `${Object.values(facts).join('\n')}\n${history.slice(-keepLastMessages).map((message) => message.content).join('\n')}`
+        : history
+            .slice(-keepLastMessages)
+            .map((message) => message.content)
+            .join('\n');
+
+    retainedImportantDetails = importantDetails.filter((detail) => finalContextText.includes(detail)).length;
+
+    return {
+      strategy,
+      scenarioTurns: scenario.length,
+      keepLastMessages,
+      promptTokensTotal,
+      averageInputTokens: Math.round(promptTokensTotal / scenario.length),
+      retainedImportantDetails,
+      quality:
+        strategy === 'sticky-facts'
+          ? 'Высокое качество итогового ответа: ранние требования доступны как key-value facts.'
+          : strategy === 'branching'
+            ? 'Высокое качество внутри выбранной ветки, но общие ранние детали зависят от checkpoint.'
+            : 'Хорошо отвечает на свежие сообщения, но ранние требования выпадают из prompt.',
+      stability:
+        strategy === 'sticky-facts'
+          ? 'Стабильная: цель, ограничения, предпочтения и решения переживают длинный диалог.'
+          : strategy === 'branching'
+            ? 'Стабильная для альтернативных направлений: UI/API не смешиваются после развилки.'
+            : 'Низкая на длинном ТЗ: важные ранние детали теряются после N сообщений.',
+      tokenSpend:
+        strategy === 'sticky-facts'
+          ? 'Средний расход: facts добавляют небольшой постоянный блок, зато не нужен полный replay.'
+          : strategy === 'branching'
+            ? 'Средний расход: каждая ветка короче общего диалога, но детали вне checkpoint не видны.'
+            : 'Минимальный расход: в prompt только последние сообщения.',
+      userConvenience:
+        strategy === 'sticky-facts'
+          ? 'Удобно для сбора ТЗ: пользователь может говорить естественно, агент держит договорённости.'
+          : strategy === 'branching'
+            ? 'Удобно для исследования альтернатив: можно переключаться между независимыми версиями.'
+            : 'Просто и предсказуемо, но пользователю приходится повторять ранние требования.'
+    };
+  });
+}
+
+function createDemoStoredMessage(role: StoredAgentMessage['role'], content: string, index: number): StoredAgentMessage {
+  return {
+    id: `demo-${role}-${index}`,
+    role,
+    content,
+    createdAt: new Date(0).toISOString()
+  };
+}
+
 function createHistoryResponse(agent: SimpleAgent, agentModel: ModelConfig, sessionId: string) {
   return agent.history().then((history) => ({
     session: {
@@ -742,7 +886,12 @@ async function listAgentChats(agentModel: ModelConfig): Promise<PublicAgentChat[
     .sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''));
 }
 
-function createAgent(agentModel: ModelConfig, sessionId: string) {
+function createAgent(
+  agentModel: ModelConfig,
+  sessionId: string,
+  contextStrategy: ContextStrategy = 'sliding-window',
+  branch?: { checkpointMessageCount?: number; branchId?: string }
+) {
   return new SimpleAgent({
     name: 'Simple LLM Agent',
     provider: agentDefinition.provider,
@@ -755,11 +904,14 @@ function createAgent(agentModel: ModelConfig, sessionId: string) {
     tokenBudget: createTokenBudget(agentModel),
     maxContextMessages: readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? undefined,
     maxContextCharacters: readOptionalNumberEnv('AGENT_MAX_CONTEXT_CHARACTERS') ?? undefined,
-    compression: {
-      enabled: readOptionalBooleanEnv('AGENT_CONTEXT_COMPRESSION_ENABLED') ?? true,
-      keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
-      summaryBatchMessages: readOptionalNumberEnv('AGENT_CONTEXT_SUMMARY_BATCH_MESSAGES') ?? 5
-    },
+    contextStrategy,
+    keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
+    branch: branch?.branchId
+      ? {
+          branchId: branch.branchId,
+          checkpointMessageCount: branch.checkpointMessageCount
+        }
+      : undefined,
     complete: (messages, options) => requestCompletion(agentModel, messages, options)
   });
 }
@@ -868,6 +1020,88 @@ app.get('/api/agent/token-demo', (_req: Request, res: Response) => {
   } catch (error) {
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Token demo configuration is incomplete.'
+    });
+  }
+});
+
+app.get('/api/agent/context-strategies/demo', (_req: Request, res: Response) => {
+  try {
+    const tokenDemoConfig = readAgentTokenDemoConfig();
+
+    return res.json({
+      title: 'Сбор ТЗ: 12 сообщений, один финальный запрос',
+      comparedBy: ['quality', 'stability', 'tokenSpend', 'userConvenience'],
+      results: buildContextStrategyComparison({
+        pricing: {
+          inputPricePerMillion: tokenDemoConfig.inputPricePerMillion,
+          outputPricePerMillion: tokenDemoConfig.outputPricePerMillion,
+          priceCurrency: tokenDemoConfig.priceCurrency
+        },
+        budget: {
+          maxContextTokens: tokenDemoConfig.maxContextTokens,
+          reservedOutputTokens: tokenDemoConfig.reservedOutputTokens
+        }
+      })
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Context strategy demo configuration is incomplete.'
+    });
+  }
+});
+
+app.post('/api/agent/branches', async (req: Request, res: Response) => {
+  const request = readBranchRequest(req.body);
+
+  if (typeof request === 'string') {
+    return res.status(400).json({ error: request });
+  }
+
+  let agentModel: ModelConfig;
+  try {
+    agentModel = readAgentModelConfig();
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+    });
+  }
+
+  const sourceSessionId = normalizeSessionId(request.sessionId);
+  const sourceAgent = createAgent(agentModel, sourceSessionId);
+
+  try {
+    const sourceHistory = await sourceAgent.history();
+    const checkpointMessageCount = Math.min(request.checkpointMessageCount ?? sourceHistory.length, sourceHistory.length);
+    const checkpointHistory = sourceHistory.slice(0, checkpointMessageCount);
+    const stamp = Date.now().toString(36);
+    const branchBase = sourceSessionId.slice(0, 24);
+    const branches = [
+      { label: 'UI ветка', sessionId: normalizeSessionId(`${branchBase}-ui-${stamp}`) },
+      { label: 'API ветка', sessionId: normalizeSessionId(`${branchBase}-api-${stamp}`) }
+    ];
+
+    await Promise.all(
+      branches.map(async (branch) => {
+        const branchStore = createAgentConversationStore(branch.sessionId);
+        await branchStore.clear();
+        await branchStore.appendMany(
+          checkpointHistory.map((message) => ({
+            role: message.role,
+            content: message.content
+          }))
+        );
+      })
+    );
+
+    return res.json({
+      sourceSessionId,
+      checkpointMessageCount,
+      branches
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to create branches.'
     });
   }
 });
@@ -986,7 +1220,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   }
 
   const sessionId = normalizeSessionId(request.sessionId);
-  const agent = createAgent(agentModel, sessionId);
+  const agent = createAgent(agentModel, sessionId, request.contextStrategy);
 
   try {
     const result = await agent.run(request.message);

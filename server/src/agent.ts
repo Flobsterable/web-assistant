@@ -30,22 +30,27 @@ export type ConversationSummary = {
   createdAt: string;
 };
 
-export type ConversationCompressionReport = {
-  enabled: boolean;
+export type ContextStrategy = 'sliding-window' | 'sticky-facts' | 'branching';
+
+export type ConversationFacts = Record<string, string>;
+
+export type ConversationContextReport = {
+  strategy: ContextStrategy;
   keepLastMessages: number;
-  summaryBatchMessages: number;
   fullHistoryMessages: number;
   exactHistoryMessages: number;
-  summarizedMessages: number;
-  summaryCount: number;
   fullHistoryTokens: number;
-  compressedHistoryTokens: number;
+  selectedHistoryTokens: number;
+  factsTokens: number;
   uncompressedInputTokens: number;
-  compressedInputTokens: number;
+  managedInputTokens: number;
   savedInputTokens: number;
   savedInputPercent: number;
-  summarizationInputTokens: number;
-  summarizationOutputTokens: number;
+  facts: ConversationFacts;
+  branch?: {
+    checkpointMessageCount: number;
+    branchId: string;
+  };
 };
 
 export type AgentCompletionResult = {
@@ -55,7 +60,7 @@ export type AgentCompletionResult = {
   totalTokens: number | null;
   tokenSource: 'api' | 'estimated';
   tokenReport?: AgentTokenReport;
-  compression?: ConversationCompressionReport;
+  contextManagement?: ConversationContextReport;
   cost: number | null;
   priceCurrency: string;
   elapsedMs: number;
@@ -85,6 +90,8 @@ type ConversationStore = {
   load: () => Promise<StoredAgentMessage[]>;
   loadSummaries: () => Promise<ConversationSummary[]>;
   replaceSummaries: (summaries: ConversationSummary[]) => Promise<void>;
+  loadFacts: () => Promise<ConversationFacts>;
+  replaceFacts: (facts: ConversationFacts) => Promise<void>;
   appendMany: (messages: Array<Omit<StoredAgentMessage, 'id' | 'createdAt'>>) => Promise<StoredAgentMessage[]>;
   clear: () => Promise<void>;
 };
@@ -102,23 +109,26 @@ type SimpleAgentOptions = {
   tokenBudget?: Partial<TokenBudget>;
   maxContextMessages?: number;
   maxContextCharacters?: number;
-  compression?: {
-    enabled?: boolean;
-    keepLastMessages?: number;
-    summaryBatchMessages?: number;
+  contextStrategy?: ContextStrategy;
+  keepLastMessages?: number;
+  branch?: {
+    checkpointMessageCount?: number;
+    branchId?: string;
   };
 };
 
 type PersistedConversation = {
+  version?: number;
   messages: StoredAgentMessage[];
   summaries?: ConversationSummary[];
+  facts?: ConversationFacts;
 };
 
 type PreparedContext = {
   messages: AgentMessage[];
   exactMessages: StoredAgentMessage[];
-  summaries: ConversationSummary[];
-  report: ConversationCompressionReport;
+  facts: ConversationFacts;
+  report: ConversationContextReport;
 };
 
 function createMessageId() {
@@ -153,6 +163,12 @@ function isConversationSummary(value: unknown): value is ConversationSummary {
   );
 }
 
+function isConversationFacts(value: unknown): value is ConversationFacts {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+
+  return Object.values(value as Record<string, unknown>).every((fact) => typeof fact === 'string');
+}
+
 function normalizePositiveInteger(value: number | undefined, fallback: number) {
   if (value === undefined || !Number.isFinite(value) || value < 1) return fallback;
   return Math.floor(value);
@@ -177,7 +193,18 @@ export class JsonConversationStore implements ConversationStore {
   async replaceSummaries(summaries: ConversationSummary[]) {
     await this.enqueueWrite(async () => {
       const persisted = await this.loadPersisted();
-      await this.save(persisted.messages, summaries);
+      await this.save({ ...persisted, summaries });
+    });
+  }
+
+  async loadFacts() {
+    return (await this.loadPersisted()).facts ?? {};
+  }
+
+  async replaceFacts(facts: ConversationFacts) {
+    await this.enqueueWrite(async () => {
+      const persisted = await this.loadPersisted();
+      await this.save({ ...persisted, facts });
     });
   }
 
@@ -194,14 +221,14 @@ export class JsonConversationStore implements ConversationStore {
         }))
       ].slice(-this.maxStoredMessages);
 
-      await this.save(nextMessages, persisted.summaries ?? []);
+      await this.save({ ...persisted, messages: nextMessages });
       return nextMessages;
     });
   }
 
   async clear() {
     await this.enqueueWrite(async () => {
-      await this.save([], []);
+      await this.save({ messages: [], summaries: [], facts: {} });
     });
   }
 
@@ -212,14 +239,15 @@ export class JsonConversationStore implements ConversationStore {
 
       return {
         messages: Array.isArray(parsed.messages) ? parsed.messages.filter(isStoredAgentMessage) : [],
-        summaries: Array.isArray(parsed.summaries) ? parsed.summaries.filter(isConversationSummary) : []
+        summaries: Array.isArray(parsed.summaries) ? parsed.summaries.filter(isConversationSummary) : [],
+        facts: isConversationFacts(parsed.facts) ? parsed.facts : {}
       };
     } catch (error) {
       if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
-        return { messages: [], summaries: [] };
+        return { messages: [], summaries: [], facts: {} };
       }
       await this.backupUnreadableFile();
-      return { messages: [], summaries: [] };
+      return { messages: [], summaries: [], facts: {} };
     }
   }
 
@@ -242,10 +270,10 @@ export class JsonConversationStore implements ConversationStore {
     return nextOperation;
   }
 
-  private async save(messages: StoredAgentMessage[], summaries: ConversationSummary[]) {
+  private async save(persisted: PersistedConversation) {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify({ version: 2, messages, summaries }, null, 2)}\n`, 'utf8');
+    await writeFile(temporaryPath, `${JSON.stringify({ version: 3, ...persisted }, null, 2)}\n`, 'utf8');
     await rename(temporaryPath, this.filePath);
   }
 }
@@ -263,9 +291,12 @@ export class SimpleAgent {
   private readonly tokenBudget?: Partial<TokenBudget>;
   private readonly maxContextMessages: number;
   private readonly maxContextCharacters: number;
-  private readonly compressionEnabled: boolean;
+  private readonly contextStrategy: ContextStrategy;
   private readonly keepLastMessages: number;
-  private readonly summaryBatchMessages: number;
+  private readonly branch?: {
+    checkpointMessageCount: number;
+    branchId: string;
+  };
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -280,9 +311,15 @@ export class SimpleAgent {
     this.tokenBudget = options.tokenBudget;
     this.maxContextMessages = normalizePositiveInteger(options.maxContextMessages, 40);
     this.maxContextCharacters = normalizePositiveInteger(options.maxContextCharacters, 24_000);
-    this.compressionEnabled = options.compression?.enabled ?? true;
-    this.keepLastMessages = normalizePositiveInteger(options.compression?.keepLastMessages, 5);
-    this.summaryBatchMessages = normalizePositiveInteger(options.compression?.summaryBatchMessages, 5);
+    this.contextStrategy = options.contextStrategy ?? 'sliding-window';
+    this.keepLastMessages = normalizePositiveInteger(options.keepLastMessages, 5);
+    this.branch =
+      options.branch?.branchId && options.branch.checkpointMessageCount !== undefined
+        ? {
+            branchId: options.branch.branchId,
+            checkpointMessageCount: Math.max(0, Math.floor(options.branch.checkpointMessageCount))
+          }
+        : undefined;
   }
 
   async history() {
@@ -301,7 +338,11 @@ export class SimpleAgent {
     }
 
     const fullHistory = await this.conversationStore.load();
-    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest);
+    const facts =
+      this.contextStrategy === 'sticky-facts'
+        ? updateConversationFacts(await this.conversationStore.loadFacts(), normalizedRequest)
+        : await this.conversationStore.loadFacts();
+    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, facts);
     const initialTokenReport = createTokenReport({
       systemPrompt: this.systemPrompt,
       selectedHistory: preparedContext.messages,
@@ -344,6 +385,10 @@ export class SimpleAgent {
       }
     ]);
 
+    if (this.contextStrategy === 'sticky-facts') {
+      await this.conversationStore.replaceFacts(facts);
+    }
+
     return {
       ...completion,
       tokenReport: createTokenReport({
@@ -359,7 +404,7 @@ export class SimpleAgent {
         pricing: this.tokenPricing,
         budget: this.tokenBudget
       }),
-      compression: preparedContext.report,
+      contextManagement: preparedContext.report,
       agentName: this.name,
       agentProvider: this.provider,
       modelTitle: this.modelTitle,
@@ -375,7 +420,11 @@ export class SimpleAgent {
     }
 
     const fullHistory = await this.conversationStore.load();
-    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest);
+    const facts =
+      this.contextStrategy === 'sticky-facts'
+        ? updateConversationFacts(await this.conversationStore.loadFacts(), normalizedRequest)
+        : await this.conversationStore.loadFacts();
+    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, facts);
 
     return createTokenReport({
       systemPrompt: this.systemPrompt,
@@ -387,137 +436,26 @@ export class SimpleAgent {
     });
   }
 
-  private async prepareContext(history: StoredAgentMessage[], nextUserMessage: string): Promise<PreparedContext> {
-    if (!this.compressionEnabled) {
-      const exactMessages = this.selectMessagesForContext(history, nextUserMessage);
-      const messages = exactMessages.map(toAgentMessage);
-
-      return {
-        messages,
-        exactMessages,
-        summaries: [],
-        report: this.createCompressionReport({
-          fullHistory: history,
-          contextMessages: messages,
-          exactMessages,
-          summaries: [],
-          nextUserMessage,
-          summarizationInputTokens: 0,
-          summarizationOutputTokens: 0,
-          enabled: false
-        })
-      };
-    }
-
-    const { summaries, summarizedMessages, summarizationInputTokens, summarizationOutputTokens } =
-      await this.ensureSummaries(history);
+  private async prepareContext(
+    history: StoredAgentMessage[],
+    nextUserMessage: string,
+    facts: ConversationFacts
+  ): Promise<PreparedContext> {
     const exactMessages = this.selectMessagesForContext(history.slice(-this.keepLastMessages), nextUserMessage);
-    const summaryMessages = summaries.map((summary): AgentMessage => ({
-      role: 'assistant',
-      content: [
-        `Сжатая история (${summary.messageCount} сообщений, ${summary.startMessageId}..${summary.endMessageId}):`,
-        summary.content
-      ].join('\n')
-    }));
-    const contextMessages = this.trimContextMessages(
-      [...summaryMessages, ...exactMessages.map(toAgentMessage)],
-      nextUserMessage
-    );
+    const factMessages = this.contextStrategy === 'sticky-facts' ? createFactMessages(facts) : [];
+    const contextMessages = this.trimContextMessages([...factMessages, ...exactMessages.map(toAgentMessage)], nextUserMessage);
 
     return {
       messages: contextMessages,
       exactMessages,
-      summaries,
-      report: this.createCompressionReport({
+      facts,
+      report: this.createContextReport({
         fullHistory: history,
         contextMessages,
         exactMessages,
-        summaries,
         nextUserMessage,
-        summarizationInputTokens,
-        summarizationOutputTokens,
-        enabled: true,
-        summarizedMessages
+        facts
       })
-    };
-  }
-
-  private async ensureSummaries(history: StoredAgentMessage[]) {
-    const existingSummaries = await this.conversationStore.loadSummaries();
-    const existingById = new Map(existingSummaries.map((summary) => [summary.id, summary]));
-    const summaryChunks = this.createSummaryChunks(history);
-    const nextSummaries: ConversationSummary[] = [];
-    let summarizationInputTokens = 0;
-    let summarizationOutputTokens = 0;
-
-    for (const chunk of summaryChunks) {
-      const summaryId = createSummaryId(chunk);
-      const existingSummary = existingById.get(summaryId);
-
-      if (existingSummary) {
-        nextSummaries.push(existingSummary);
-        continue;
-      }
-
-      const summary = await this.summarizeChunk(chunk, summaryId);
-      nextSummaries.push(summary);
-      summarizationInputTokens += estimateMessagesTokens(chunk.map(toAgentMessage));
-      summarizationOutputTokens += estimateTokens(summary.content);
-    }
-
-    const changed =
-      nextSummaries.length !== existingSummaries.length ||
-      nextSummaries.some((summary, index) => summary.id !== existingSummaries[index]?.id);
-
-    if (changed) {
-      await this.conversationStore.replaceSummaries(nextSummaries);
-    }
-
-    return {
-      summaries: nextSummaries,
-      summarizedMessages: summaryChunks.reduce((total, chunk) => total + chunk.length, 0),
-      summarizationInputTokens,
-      summarizationOutputTokens
-    };
-  }
-
-  private createSummaryChunks(history: StoredAgentMessage[]) {
-    const messagesToSummarize = history.slice(0, Math.max(0, history.length - this.keepLastMessages));
-    const chunks: StoredAgentMessage[][] = [];
-
-    for (let index = 0; index < messagesToSummarize.length; index += this.summaryBatchMessages) {
-      chunks.push(messagesToSummarize.slice(index, index + this.summaryBatchMessages));
-    }
-
-    return chunks;
-  }
-
-  private async summarizeChunk(chunk: StoredAgentMessage[], summaryId: string): Promise<ConversationSummary> {
-    const transcript = chunk
-      .map((message, index) => `${index + 1}. ${message.role === 'assistant' ? 'Агент' : 'Пользователь'}: ${message.content}`)
-      .join('\n\n');
-    const completion = await this.complete(
-      [
-        {
-          role: 'system',
-          content:
-            'Ты сжимаешь историю диалога для будущего LLM-контекста. Сохраняй факты, решения, предпочтения пользователя, ограничения, открытые вопросы и результаты. Не добавляй новых фактов.'
-        },
-        {
-          role: 'user',
-          content: `Сожми этот фрагмент истории в 5-8 коротких пунктов на русском языке:\n\n${transcript}`
-        }
-      ],
-      { temperature: 0 }
-    );
-
-    return {
-      id: summaryId,
-      startMessageId: chunk[0].id,
-      endMessageId: chunk[chunk.length - 1].id,
-      messageCount: chunk.length,
-      content: completion.answer.trim(),
-      createdAt: new Date().toISOString()
     };
   }
 
@@ -565,47 +503,38 @@ export class SimpleAgent {
     return selectedMessages;
   }
 
-  private createCompressionReport(params: {
+  private createContextReport(params: {
     fullHistory: StoredAgentMessage[];
     contextMessages: AgentMessage[];
     exactMessages: StoredAgentMessage[];
-    summaries: ConversationSummary[];
     nextUserMessage: string;
-    summarizationInputTokens: number;
-    summarizationOutputTokens: number;
-    enabled: boolean;
-    summarizedMessages?: number;
-  }): ConversationCompressionReport {
+    facts: ConversationFacts;
+  }): ConversationContextReport {
     const systemPromptTokens = estimateMessageTokens({ role: 'system', content: this.systemPrompt });
     const currentRequestTokens = estimateMessageTokens({ role: 'user', content: params.nextUserMessage });
     const fullHistoryTokens = estimateMessagesTokens(params.fullHistory.map(toAgentMessage));
-    const compressedHistoryTokens = estimateMessagesTokens(params.contextMessages);
+    const selectedHistoryTokens = estimateMessagesTokens(params.contextMessages);
+    const factsTokens = estimateMessagesTokens(createFactMessages(params.facts));
     const uncompressedInputTokens = systemPromptTokens + fullHistoryTokens + currentRequestTokens;
-    const compressedInputTokens = systemPromptTokens + compressedHistoryTokens + currentRequestTokens;
-    const savedInputTokens = Math.max(0, uncompressedInputTokens - compressedInputTokens);
+    const managedInputTokens = systemPromptTokens + selectedHistoryTokens + currentRequestTokens;
+    const savedInputTokens = Math.max(0, uncompressedInputTokens - managedInputTokens);
 
     return {
-      enabled: params.enabled,
+      strategy: this.contextStrategy,
       keepLastMessages: this.keepLastMessages,
-      summaryBatchMessages: this.summaryBatchMessages,
       fullHistoryMessages: params.fullHistory.length,
       exactHistoryMessages: params.exactMessages.length,
-      summarizedMessages: params.summarizedMessages ?? 0,
-      summaryCount: params.summaries.length,
       fullHistoryTokens,
-      compressedHistoryTokens,
+      selectedHistoryTokens,
+      factsTokens,
       uncompressedInputTokens,
-      compressedInputTokens,
+      managedInputTokens,
       savedInputTokens,
       savedInputPercent: uncompressedInputTokens === 0 ? 0 : Math.round((savedInputTokens / uncompressedInputTokens) * 100),
-      summarizationInputTokens: params.summarizationInputTokens,
-      summarizationOutputTokens: params.summarizationOutputTokens
+      facts: params.facts,
+      branch: this.contextStrategy === 'branching' && this.branch ? this.branch : undefined
     };
   }
-}
-
-function createSummaryId(chunk: StoredAgentMessage[]) {
-  return `${chunk[0].id}:${chunk[chunk.length - 1].id}:${chunk.length}`;
 }
 
 function toAgentMessage(message: StoredAgentMessage): AgentMessage {
@@ -613,4 +542,55 @@ function toAgentMessage(message: StoredAgentMessage): AgentMessage {
     role: message.role,
     content: message.content
   };
+}
+
+export function createFactMessages(facts: ConversationFacts): AgentMessage[] {
+  const entries = Object.entries(facts).filter(([, value]) => value.trim());
+  if (entries.length === 0) return [];
+
+  return [
+    {
+      role: 'system',
+      content: ['Facts memory. Use these stable facts as dialogue context; do not treat them as a summary.', ...entries.map(([key, value]) => `${key}: ${value}`)].join('\n')
+    }
+  ];
+}
+
+export function updateConversationFacts(currentFacts: ConversationFacts, userMessage: string): ConversationFacts {
+  const facts: ConversationFacts = { ...currentFacts, last_user_request: compactFact(userMessage, 220) };
+  const normalized = userMessage.toLowerCase();
+
+  if (/(цель|нужно|задача|хочу реализовать|требуется)/i.test(userMessage)) {
+    facts.goal = mergeFact(facts.goal, userMessage);
+  }
+
+  if (/(огранич|нельзя|без |только|лимит|обязательно|must|should)/i.test(userMessage)) {
+    facts.constraints = mergeFact(facts.constraints, userMessage);
+  }
+
+  if (/(предпоч|важно|удобн|пользователь|ui|интерфейс|стиль)/i.test(userMessage)) {
+    facts.preferences = mergeFact(facts.preferences, userMessage);
+  }
+
+  if (/(решили|договор|выбираем|оставляем|будем|стратег)/i.test(userMessage)) {
+    facts.decisions = mergeFact(facts.decisions, userMessage);
+  }
+
+  if (normalized.includes('сравн') || normalized.includes('качество') || normalized.includes('токен')) {
+    facts.evaluation_focus = mergeFact(facts.evaluation_focus, userMessage);
+  }
+
+  return Object.fromEntries(Object.entries(facts).map(([key, value]) => [key, compactFact(value, 520)]));
+}
+
+function mergeFact(previous: string | undefined, next: string) {
+  const compactNext = compactFact(next, 220);
+  if (!previous) return compactNext;
+  if (previous.includes(compactNext)) return previous;
+  return `${previous}; ${compactNext}`;
+}
+
+function compactFact(value: string, maxLength: number) {
+  const compacted = value.replace(/\s+/g, ' ').trim();
+  return compacted.length > maxLength ? `${compacted.slice(0, maxLength - 1).trim()}…` : compacted;
 }

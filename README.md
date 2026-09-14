@@ -21,7 +21,7 @@ server/agents/simple-agent.md
 В этом же файле лежат дефолтные настройки агента: модель, temperature, язык, system prompt и демонстрационные лимиты контекста:
 
 ```text
-max_context_tokens: 4000
+max_context_tokens: 40000
 reserved_output_tokens: 500
 ```
 
@@ -67,10 +67,8 @@ DEEPSEEK_API_KEY=your_deepseek_api_key_here
 ```bash
 AGENT_MAX_CONTEXT_MESSAGES=40
 AGENT_MAX_CONTEXT_CHARACTERS=24000
-AGENT_CONTEXT_COMPRESSION_ENABLED=true
 AGENT_CONTEXT_KEEP_LAST_MESSAGES=5
-AGENT_CONTEXT_SUMMARY_BATCH_MESSAGES=5
-MODEL_MAX_CONTEXT_TOKENS=4000
+MODEL_MAX_CONTEXT_TOKENS=40000
 MODEL_RESERVED_OUTPUT_TOKENS=500
 ```
 

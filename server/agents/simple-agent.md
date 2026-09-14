@@ -5,7 +5,7 @@ model_env_prefix: MODEL_FLASH
 model: deepseek-v4-flash
 temperature: 0.2
 language: ru
-max_context_tokens: 4000
+max_context_tokens: 40000
 reserved_output_tokens: 500
 
 ## System Prompt
