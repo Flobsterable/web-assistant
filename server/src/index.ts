@@ -217,6 +217,14 @@ function readOptionalNumberEnv(name: string) {
   return parsed;
 }
 
+function readOptionalBooleanEnv(name: string) {
+  const value = readOptionalTextEnv(name)?.toLowerCase();
+  if (!value) return null;
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  throw new Error(`${name} must be a boolean value.`);
+}
+
 function readAgentDefinition(filePath: string): AgentDefinition {
   const content = readFileSync(filePath, 'utf8');
   const [metadataBlock, systemPromptBlock = ''] = content.split('## System Prompt');
@@ -747,6 +755,11 @@ function createAgent(agentModel: ModelConfig, sessionId: string) {
     tokenBudget: createTokenBudget(agentModel),
     maxContextMessages: readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? undefined,
     maxContextCharacters: readOptionalNumberEnv('AGENT_MAX_CONTEXT_CHARACTERS') ?? undefined,
+    compression: {
+      enabled: readOptionalBooleanEnv('AGENT_CONTEXT_COMPRESSION_ENABLED') ?? true,
+      keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
+      summaryBatchMessages: readOptionalNumberEnv('AGENT_CONTEXT_SUMMARY_BATCH_MESSAGES') ?? 5
+    },
     complete: (messages, options) => requestCompletion(agentModel, messages, options)
   });
 }

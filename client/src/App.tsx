@@ -7,6 +7,7 @@ type AgentResponse = {
   totalTokens: number | null;
   tokenSource: 'api' | 'estimated';
   tokenReport?: AgentTokenReport;
+  compression?: CompressionReport;
   cost: number | null;
   priceCurrency: string;
   elapsedMs: number;
@@ -117,6 +118,24 @@ type AgentTokenReport = {
   priceCurrency: string;
 };
 
+type CompressionReport = {
+  enabled: boolean;
+  keepLastMessages: number;
+  summaryBatchMessages: number;
+  fullHistoryMessages: number;
+  exactHistoryMessages: number;
+  summarizedMessages: number;
+  summaryCount: number;
+  fullHistoryTokens: number;
+  compressedHistoryTokens: number;
+  uncompressedInputTokens: number;
+  compressedInputTokens: number;
+  savedInputTokens: number;
+  savedInputPercent: number;
+  summarizationInputTokens: number;
+  summarizationOutputTokens: number;
+};
+
 type HistoryTokenStats = {
   messageCount: number;
   userMessageCount: number;
@@ -197,6 +216,16 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           <span>ответ: {formatTokens(message.meta.tokenReport?.outputTokens ?? message.meta.outputTokens)}</span>
           <span>total: {formatTokens(message.meta.totalTokens)}</span>
           <span>стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
+        </footer>
+      )}
+      {message.meta?.compression && (
+        <footer className="message-meta compression-meta">
+          <span>сжатие: {message.meta.compression.enabled ? 'вкл' : 'выкл'}</span>
+          <span>summary: {formatTokens(message.meta.compression.summaryCount)}</span>
+          <span>как есть: {formatTokens(message.meta.compression.exactHistoryMessages)}</span>
+          <span>input без сжатия: {formatTokens(message.meta.compression.uncompressedInputTokens)}</span>
+          <span>input со сжатием: {formatTokens(message.meta.compression.compressedInputTokens)}</span>
+          <span>экономия: {formatTokens(message.meta.compression.savedInputTokens)} ({message.meta.compression.savedInputPercent}%)</span>
         </footer>
       )}
       {message.responseMeta && !message.meta && (

@@ -118,7 +118,7 @@ export function calculateCost(
 
 export function createTokenReport(params: {
   systemPrompt: string;
-  selectedHistory: StoredAgentMessage[];
+  selectedHistory: Array<Pick<AgentMessage, 'role' | 'content'>>;
   fullHistory: StoredAgentMessage[];
   currentRequest: string;
   outputText?: string;
@@ -131,7 +131,7 @@ export function createTokenReport(params: {
 }): AgentTokenReport {
   const budget = normalizeTokenBudget(params.budget);
   const currentRequestMessage = { role: 'user' as const, content: params.currentRequest };
-  const selectedHistoryMessages = params.selectedHistory.map(toAgentMessage);
+  const selectedHistoryMessages = params.selectedHistory;
   const fullHistoryMessages = params.fullHistory.map(toAgentMessage);
   const systemPromptTokens = estimateMessageTokens({ role: 'system', content: params.systemPrompt });
   const currentRequestTokens = estimateMessageTokens(currentRequestMessage);
