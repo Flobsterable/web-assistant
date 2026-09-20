@@ -19,6 +19,7 @@ type AgentResponse = {
   stats?: HistoryTokenStats;
   turnId?: string;
   memoryEvents?: MemoryEvent[];
+  task?: TaskState | null;
 };
 
 type AgentErrorResponse = {
@@ -227,6 +228,30 @@ type PendingMemorySuggestion = {
 
 type PendingMemoryResponse = { sessionId: string; suggestions: PendingMemorySuggestion[] };
 
+type TaskPhase = 'planning' | 'execution' | 'validation' | 'done';
+type TaskStatus = 'active' | 'paused' | 'done';
+type TaskState = {
+  id: string;
+  title: string;
+  phase: TaskPhase;
+  currentStep: string;
+  expectedAction: string;
+  status: TaskStatus;
+  sourceSessionId: string;
+  activeSessionId: string | null;
+  snapshot: { goal: string; nextSteps: string[] };
+  updatedAt: string;
+};
+type TasksResponse = { profileId: string; tasks: TaskState[] };
+
+const taskPhaseTitles: Record<TaskPhase, string> = {
+  planning: 'Планирование', execution: 'Выполнение', validation: 'Проверка', done: 'Готово'
+};
+
+const taskStatusTitles: Record<TaskStatus, string> = {
+  active: 'В работе', paused: 'На паузе', done: 'Завершена'
+};
+
 function formatDuration(ms: number) {
   if (ms < 1000) return `${ms} мс`;
   return `${(ms / 1000).toFixed(2)} с`;
@@ -255,6 +280,10 @@ function memoryKeyTitle(key: string) {
   const titles: Record<string, string> = {
     'task.goal': 'Цель задачи',
     'task.state': 'Текущее состояние',
+    'task.stage': 'Этап задачи',
+    'task.current_step': 'Текущий шаг',
+    'task.expected_action': 'Ожидаемое действие',
+    'task.validation': 'Результат проверки',
     'task.constraints': 'Ограничения',
     'task.decisions': 'Принятые решения',
     'task.artifacts': 'Материалы и файлы',
@@ -388,6 +417,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [memory, setMemory] = useState<MemoryResponse>();
   const [pendingMemory, setPendingMemory] = useState<PendingMemorySuggestion[]>([]);
+  const [tasks, setTasks] = useState<TaskState[]>([]);
   const [memoryLayer, setMemoryLayer] = useState<MemoryLayer>('working');
   const [memoryCategory, setMemoryCategory] = useState<MemoryCategory>('goal');
   const [memoryKey, setMemoryKey] = useState('');
@@ -414,6 +444,10 @@ export default function App() {
     () => profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0],
     [profiles, selectedProfileId]
   );
+  const currentTask = useMemo(
+    () => tasks.find((task) => task.status === 'active' && task.activeSessionId === sessionId),
+    [tasks, sessionId]
+  );
 
   useEffect(() => {
     if (!selectedProfile || isCreatingProfile) return;
@@ -431,13 +465,14 @@ export default function App() {
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
         const memoryQuery = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
-        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse] = await Promise.all([
+        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse, tasksResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
           fetch('/api/profiles', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
           fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
           fetch(`/api/agent/memory?${memoryQuery}`, { signal: controller.signal }),
-          fetch(`/api/agent/memory/pending?${memoryQuery}`, { signal: controller.signal })
+          fetch(`/api/agent/memory/pending?${memoryQuery}`, { signal: controller.signal }),
+          fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`, { signal: controller.signal })
         ]);
         const data = (await configResponse.json()) as AppConfig;
 
@@ -492,6 +527,7 @@ export default function App() {
         if (pendingResponse.ok) {
           setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
         }
+        if (tasksResponse.ok) setTasks(((await tasksResponse.json()) as TasksResponse).tasks);
 
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return;
@@ -521,8 +557,26 @@ export default function App() {
     setError('');
   }
 
-  function handleNewChat() {
-    openChat(createSessionId());
+  async function handleNewChat() {
+    const nextSessionId = createSessionId();
+    setError('');
+    if (currentTask) {
+      try {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(currentTask.id)}/pause`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profileId: selectedProfileId })
+        });
+        const data = (await response.json()) as { task?: TaskState; error?: string };
+        if (!response.ok) throw new Error(data.error ?? 'Не удалось поставить текущую задачу на паузу.');
+        if (data.task) {
+          setTasks((current) => current.map((task) => task.id === data.task?.id ? data.task as TaskState : task));
+        }
+      } catch (caughtError) {
+        setError(caughtError instanceof Error ? caughtError.message : 'Не удалось поставить текущую задачу на паузу.');
+      }
+    }
+    openChat(nextSessionId);
   }
 
   async function handleDeleteChat(chatSessionId: string) {
@@ -577,13 +631,39 @@ export default function App() {
 
   async function refreshMemory() {
     const query = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
-    const [response, pendingResponse] = await Promise.all([
+    const [response, pendingResponse, tasksResponse] = await Promise.all([
       fetch(`/api/agent/memory?${query}`),
-      fetch(`/api/agent/memory/pending?${query}`)
+      fetch(`/api/agent/memory/pending?${query}`),
+      fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`)
     ]);
-    if (!response.ok || !pendingResponse.ok) throw new Error('Не удалось загрузить память.');
+    if (!response.ok || !pendingResponse.ok || !tasksResponse.ok) throw new Error('Не удалось загрузить память.');
     setMemory((await response.json()) as MemoryResponse);
     setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
+    setTasks(((await tasksResponse.json()) as TasksResponse).tasks);
+  }
+
+  async function handleOpenTask(task: TaskState) {
+    setError('');
+    if (task.status === 'done') {
+      openChat(task.sourceSessionId);
+      return;
+    }
+    try {
+      const taskSessionId = task.activeSessionId ?? task.sourceSessionId ?? createSessionId();
+      const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: taskSessionId, profileId: selectedProfileId })
+      });
+      const data = (await response.json()) as { task?: TaskState; error?: string };
+      if (!response.ok) throw new Error(data.error ?? 'Не удалось продолжить задачу.');
+      if (data.task) {
+        setTasks((current) => current.map((item) => item.id === data.task?.id ? data.task as TaskState : item));
+      }
+      openChat(taskSessionId);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось продолжить задачу.');
+    }
   }
 
   async function handlePendingMemory(id: string, action: 'approve' | 'reject') {
@@ -805,6 +885,31 @@ export default function App() {
               ))
             )}
           </div>
+
+          <section className="sidebar-tasks" aria-label="Сохранённые задачи">
+            <div className="sidebar-tasks-header">
+              <div><span>Долгосрочная память</span><strong>Задачи</strong></div>
+              <b>{tasks.length}</b>
+            </div>
+            <div className="sidebar-task-list">
+              {tasks.length === 0 ? (
+                <p className="chat-list-empty">Отложенных задач пока нет.</p>
+              ) : tasks.map((task) => (
+                <button
+                  className={`sidebar-task-item ${task.activeSessionId === sessionId ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => void handleOpenTask(task)}
+                  key={task.id}
+                >
+                  <span className="sidebar-task-title">{task.title}</span>
+                  <span className="sidebar-task-meta">
+                    <i data-status={task.status}>{taskStatusTitles[task.status]}</i>
+                    <small>{taskPhaseTitles[task.phase]}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </section>
         </aside>
 
         <div className="app-frame">
@@ -822,6 +927,24 @@ export default function App() {
               </button>
             </div>
           </header>
+
+          {currentTask && (
+            <section className="current-task-panel" aria-label="Текущая задача">
+              <div className="task-state-heading">
+                <div><small>Текущая задача</small><strong>{currentTask.title}</strong></div>
+                <span data-status={currentTask.status}>{taskStatusTitles[currentTask.status]}</span>
+              </div>
+              <div className="task-stage-track" aria-label={`Этап: ${taskPhaseTitles[currentTask.phase]}`}>
+                {(['planning', 'execution', 'validation', 'done'] as const).map((phase) => (
+                  <span className={phase === currentTask.phase ? 'current' : ''} key={phase}>{taskPhaseTitles[phase]}</span>
+                ))}
+              </div>
+              <dl className="task-state-details">
+                <div><dt>Текущий шаг</dt><dd>{currentTask.currentStep}</dd></div>
+                <div><dt>Ожидаемое действие</dt><dd>{currentTask.expectedAction}</dd></div>
+              </dl>
+            </section>
+          )}
 
           {(selectedModel || historyStats) && (
             <section className={`compact-metrics ${historyStats?.willOverflowOnNextSmallRequest ? 'overflow' : ''}`} aria-label="Лимиты и статистика">

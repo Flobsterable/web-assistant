@@ -15,7 +15,21 @@ export type MemoryPolicyOptions = {
   longTermAutoSaveThreshold?: number;
   memoryStore: AgentMemoryStore;
   pendingStore: JsonPendingMemoryStore;
+  taskContextValues?: string[];
 };
+
+function normalizedWords(value: string) {
+  return new Set(value.toLocaleLowerCase('ru').match(/[\p{L}\p{N}]{4,}/gu) ?? []);
+}
+
+function profileCandidateLooksTaskScoped(candidate: MemoryCandidate, taskContextValues: string[]) {
+  if (candidate.category !== 'profile' || !candidate.value || taskContextValues.length === 0) return false;
+  const candidateWords = normalizedWords(candidate.value);
+  if (candidateWords.size === 0) return false;
+  const taskWords = normalizedWords(taskContextValues.join('\n'));
+  const sharedWords = [...candidateWords].filter((word) => taskWords.has(word));
+  return sharedWords.length >= 3 && sharedWords.length / candidateWords.size >= 0.2;
+}
 
 function event(type: MemoryEvent['type'], candidate: MemoryCandidate, reason: string, extra: Partial<MemoryEvent> = {}): MemoryEvent {
   return { type, scope: candidate.scope, candidate, reason, createdAt: new Date().toISOString(), ...extra };
@@ -43,6 +57,11 @@ export async function applyMemoryPolicy(candidates: MemoryCandidate[], options: 
     }
     if (candidate.confidence < options.confidenceThreshold) {
       events.push(event('clarification_required', candidate, `Confidence ${candidate.confidence} is below ${options.confidenceThreshold}.`));
+      continue;
+    }
+    const taskContextValues = options.taskContextValues ?? snapshot.working.map((entry) => entry.value);
+    if (candidate.scope === 'long-term' && profileCandidateLooksTaskScoped(candidate, taskContextValues)) {
+      events.push(event('skipped', candidate, 'Task-specific context cannot be saved as a user profile automatically.'));
       continue;
     }
 

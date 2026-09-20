@@ -19,6 +19,17 @@ import { JsonPendingMemoryStore } from './pending-memory.js';
 import { JsonUserProfileStore, normalizeProfileId, validateUserProfileInput, type UserProfile } from './profile.js';
 import { AgentTurnLogger, listAgentLogs, readAgentLog } from './agent-log.js';
 import {
+  classifyTaskCommand,
+  detectTaskCommand,
+  JsonTaskStateStore,
+  snapshotFromWorkingMemory,
+  taskToWorkingWrites,
+  resolveTaskPhaseTransition,
+  type TaskCommand,
+  type TaskPhase,
+  type TaskState
+} from './task-state.js';
+import {
   buildTokenDemo,
   calculateCost,
   createHistoryTokenStats,
@@ -365,6 +376,7 @@ const longTermMemoryPath = path.join(agentDataPath, 'memory', 'long-term');
 const pendingMemoryPath = path.join(agentDataPath, 'memory', 'pending');
 const profilesPath = path.join(agentDataPath, 'profiles');
 const agentLogsPath = path.join(agentDataPath, 'agent-logs');
+const tasksPath = path.join(agentDataPath, 'tasks');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 
@@ -625,6 +637,11 @@ const userProfileStore = new JsonUserProfileStore(profilesPath);
 
 function createPendingMemoryStore(sessionId: string) {
   return new JsonPendingMemoryStore(path.join(pendingMemoryPath, `${sessionId}.json`));
+}
+
+function createTaskStateStore(profileId: string) {
+  const normalizedProfileId = normalizeProfileId(profileId);
+  return new JsonTaskStateStore(path.join(tasksPath, `${normalizedProfileId}.json`), normalizedProfileId);
 }
 
 function readMemoryConfidenceThreshold() {
@@ -986,6 +1003,52 @@ app.get('/api/agent/memory/pending', async (req: Request, res: Response) => {
   }
 });
 
+app.get('/api/tasks', async (req: Request, res: Response) => {
+  const profileId = readProfileIdFromRequest(req);
+  try {
+    return res.json({ profileId, tasks: await createTaskStateStore(profileId).list() });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load tasks.' });
+  }
+});
+
+app.post('/api/tasks/:id/resume', async (req: Request, res: Response) => {
+  const profileId = normalizeProfileId(req.body?.profileId);
+  const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    const task = await createTaskStateStore(profileId).resume(id, sessionId);
+    if (!task) return res.status(404).json({ error: 'Задача не найдена или уже завершена.' });
+    await createAgentMemoryStore(sessionId, profileId).replaceAgentWorking(taskToWorkingWrites(task));
+    return res.json({ task });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to resume task.' });
+  }
+});
+
+app.post('/api/tasks/:id/pause', async (req: Request, res: Response) => {
+  const profileId = normalizeProfileId(req.body?.profileId);
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    const task = await createTaskStateStore(profileId).pauseExisting(id);
+    if (!task) return res.status(404).json({ error: 'Активная задача не найдена.' });
+    return res.json({ task });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to pause task.' });
+  }
+});
+
+app.delete('/api/tasks/:id', async (req: Request, res: Response) => {
+  const profileId = readProfileIdFromRequest(req);
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    await createTaskStateStore(profileId).remove(id);
+    return res.status(204).send();
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete task.' });
+  }
+});
+
 app.post('/api/agent/memory/pending/:id/approve', async (req: Request, res: Response) => {
   const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -1239,6 +1302,46 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
 
   try {
+    const taskStore = createTaskStateStore(request.profileId);
+    let [memoryBeforeTaskCommand, historyBeforeTaskCommand, savedTasks] = await Promise.all([
+      createAgentMemoryStore(sessionId, request.profileId).load(),
+      createAgentConversationStore(sessionId).load(),
+      taskStore.list()
+    ]);
+    const sessionHasActiveTask = savedTasks.some((task) => task.status === 'active' && task.activeSessionId === sessionId);
+    if (historyBeforeTaskCommand.length === 0 && !sessionHasActiveTask && memoryBeforeTaskCommand.working.length > 0) {
+      await createAgentMemoryStore(sessionId, request.profileId).clearWorking();
+      memoryBeforeTaskCommand = await createAgentMemoryStore(sessionId, request.profileId).load();
+    }
+    let taskCommand: TaskCommand;
+    try {
+      taskCommand = await logger.step('task_intent_classification', () => classifyTaskCommand({
+        message: request.message,
+        workingMemory: memoryBeforeTaskCommand.working,
+        recentHistory: historyBeforeTaskCommand.map(({ role, content }) => ({ role, content })),
+        savedTasks,
+        complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
+      }), { provider: agentDefinition.provider, model: agentModel.model });
+    } catch {
+      taskCommand = detectTaskCommand(request.message);
+    }
+    let resumedTask: TaskState | null = null;
+    if (taskCommand.type === 'resume') {
+      const taskToResume = taskCommand.taskId
+        ? savedTasks.find((task) => task.id === taskCommand.taskId && task.status !== 'done') ?? null
+        : await taskStore.findForResume(taskCommand.latest ? null : taskCommand.query);
+      if (!taskToResume) {
+        return res.status(404).json({
+          error: taskCommand.query
+            ? `Не нашёл сохранённую задачу «${taskCommand.query}».`
+            : 'У этого пользователя пока нет незавершённых сохранённых задач.'
+        });
+      }
+      resumedTask = await taskStore.resume(taskToResume.id, sessionId);
+      if (resumedTask) {
+        await createAgentMemoryStore(sessionId, request.profileId).replaceAgentWorking(taskToWorkingWrites(resumedTask));
+      }
+    }
     const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId, request.profileId).load());
     await logger.step('context_assembly', async () => { await agent.inspectNextRun(request.message); });
     const result = await logger.step('provider_request', () => agent.run(request.message), {
@@ -1263,22 +1366,75 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     } catch {
       reflection = null;
     }
+    if (reflection) {
+      const previousStageValue = loadedMemory.working.find((entry) => entry.key === 'task.stage')?.value;
+      const previousStage: TaskPhase = previousStageValue === 'execution' || previousStageValue === 'validation' || previousStageValue === 'done'
+        ? previousStageValue
+        : 'planning';
+      reflection.working.stage = resolveTaskPhaseTransition(
+        previousStage,
+        reflection.working.stage,
+        reflection.working.validationPassed
+      ).phase;
+    }
+    const workingWrites = reflection ? workingSummaryToWrites(reflection.working) : [];
     const policyEvents = await logger.step('memory_policy', () => applyMemoryPolicy(reflection?.longTermCandidates ?? [], {
       sessionId,
       profileId: request.profileId,
       confidenceThreshold: readMemoryConfidenceThreshold(),
       longTermAutoSaveThreshold: readProfileAutoSaveThreshold(),
       memoryStore: createAgentMemoryStore(sessionId, request.profileId),
-      pendingStore: createPendingMemoryStore(sessionId)
+      pendingStore: createPendingMemoryStore(sessionId),
+      taskContextValues: workingWrites.map((write) => write.value)
     }));
     await logger.annotate('memory_policy', { memoryEvents: policyEvents });
-    const workingWrites = reflection ? workingSummaryToWrites(reflection.working) : [];
     const workingEvent: MemoryEvent | null = reflection ? {
       type: 'updated', scope: 'working', reason: 'Сжатый контекст текущей задачи обновлён.', createdAt: new Date().toISOString()
     } : null;
     await logger.step('memory_persist', async () => {
       if (reflection) await createAgentMemoryStore(sessionId, request.profileId).replaceAgentWorking(workingWrites);
     }, { memoryEvents: workingEvent ? [workingEvent, ...policyEvents] : policyEvents });
+    let taskState: TaskState | null = resumedTask;
+    const snapshot = reflection ? {
+      goal: reflection.working.goal,
+      constraints: reflection.working.constraints,
+      decisions: reflection.working.decisions,
+      artifacts: reflection.working.artifacts,
+      nextSteps: reflection.working.nextSteps
+    } : snapshotFromWorkingMemory(loadedMemory.working);
+    const phase: TaskPhase = reflection?.working.stage
+      ?? (loadedMemory.working.find((entry) => entry.key === 'task.stage')?.value as TaskPhase | undefined)
+      ?? 'planning';
+    const currentStep = reflection?.working.currentStep
+      || loadedMemory.working.find((entry) => entry.key === 'task.current_step')?.value
+      || reflection?.working.state
+      || 'Продолжить работу над задачей';
+    const expectedAction = reflection?.working.expectedAction
+      || loadedMemory.working.find((entry) => entry.key === 'task.expected_action')?.value
+      || snapshot.nextSteps[0]
+      || 'Определить следующий шаг';
+    if (taskCommand.type === 'pause') {
+      taskState = await taskStore.pause({
+        title: taskCommand.query || snapshot.goal.slice(0, 100) || `Задача ${new Date().toLocaleDateString('ru-RU')}`,
+        phase,
+        currentStep,
+        expectedAction,
+        sourceSessionId: sessionId,
+        snapshot
+      });
+    } else {
+      const activeTask = resumedTask ?? await taskStore.findActiveForSession(sessionId);
+      if (activeTask && reflection) {
+        taskState = await taskStore.updateProgress(activeTask.id, {
+          phase,
+          currentStep,
+          expectedAction,
+          snapshot,
+          validationPassed: reflection.working.validationPassed,
+          validationSummary: reflection.working.validationSummary
+        });
+      }
+    }
     const memoryEvents = workingEvent ? [workingEvent, ...policyEvents] : policyEvents;
     return res.json({
       ...result,
@@ -1286,6 +1442,8 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       memoryReflection: reflection,
       memoryEvents,
       profile: userProfile,
+      task: taskState,
+      taskCommand: taskCommand.type,
       session: {
         sessionId,
         title: createChatTitle(history, sessionId)

@@ -70,6 +70,25 @@ test('only highly important profile facts are saved to long-term memory automati
   }
 });
 
+test('current task details cannot be promoted to the user profile', async () => {
+  const item = await fixture();
+  try {
+    const events = await applyMemoryPolicy([{
+      scope: 'long-term', operation: 'create', category: 'profile', key: 'profile.preferences',
+      value: 'Разрабатывает приложение тренировок на KMP с Garmin, Apple Health и Samsung Health в режиме чтения метрик',
+      confidence: 0.98, importance: 0.95, reason: 'Repeated project details.'
+    }], {
+      sessionId: 'a', profileId: 'default', confidenceThreshold: 0.75, longTermAutoSaveThreshold: 0.7,
+      memoryStore: item.memory, pendingStore: item.pending,
+      taskContextValues: ['Разработать приложение тренировок на KMP', 'Интеграция Garmin, Apple Health и Samsung Health', 'Только чтение метрик']
+    });
+    assert.equal(events[0]?.type, 'skipped');
+    assert.equal((await item.memory.load()).longTerm.length, 0);
+  } finally {
+    await rm(item.directory, { recursive: true, force: true });
+  }
+});
+
 test('low confidence, duplicates, invalid targets and rejection do not mutate memory', async () => {
   const item = await fixture();
   try {

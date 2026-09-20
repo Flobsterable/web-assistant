@@ -42,9 +42,12 @@ select {
 }
 
 .chat-sidebar {
+  display: flex;
+  flex-direction: column;
   position: sticky;
   top: 16px;
   align-self: start;
+  max-height: calc(100vh - 32px);
   min-height: calc(100vh - 32px);
   border: 1px solid #d2dce1;
   border-radius: 8px;
@@ -93,9 +96,114 @@ select {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: calc(100vh - 142px);
+  max-height: 46vh;
   overflow: auto;
   padding: 10px;
+}
+
+.sidebar-tasks {
+  min-height: 0;
+  border-top: 1px solid #e2e8eb;
+  background: #f9fbfa;
+}
+
+.sidebar-tasks-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 13px 8px;
+}
+
+.sidebar-tasks-header span,
+.sidebar-tasks-header strong {
+  display: block;
+}
+
+.sidebar-tasks-header span {
+  color: #87949c;
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.sidebar-tasks-header strong {
+  margin-top: 3px;
+  color: #253540;
+  font-size: 14px;
+}
+
+.sidebar-tasks-header > b {
+  min-width: 24px;
+  border-radius: 999px;
+  padding: 4px 7px;
+  color: #2d806f;
+  background: #e3f3ec;
+  font-size: 11px;
+  text-align: center;
+}
+
+.sidebar-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 38vh;
+  overflow: auto;
+  padding: 0 10px 10px;
+}
+
+.sidebar-task-item {
+  width: 100%;
+  border: 1px solid #dce6e2;
+  border-radius: 8px;
+  padding: 10px;
+  color: #253540;
+  background: #ffffff;
+  cursor: pointer;
+  text-align: left;
+}
+
+.sidebar-task-item:hover,
+.sidebar-task-item.active {
+  border-color: #8fc2b3;
+  background: #eef8f4;
+}
+
+.sidebar-task-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.sidebar-task-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.sidebar-task-meta i {
+  border-radius: 999px;
+  padding: 3px 6px;
+  color: #236653;
+  background: #e3f3ec;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.sidebar-task-meta i[data-status='paused'] {
+  color: #80611e;
+  background: #fff1c9;
+}
+
+.sidebar-task-meta small {
+  color: #78817d;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .chat-list-empty {
@@ -958,6 +1066,75 @@ textarea:disabled {
   text-decoration: underline;
 }
 
+.current-task-panel {
+  padding: 14px;
+  border: 1px solid #d9e4df;
+  border-radius: 14px;
+  background: #fbfdfc;
+}
+
+.current-task-panel {
+  margin: 12px 0;
+}
+
+.task-state-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-state-heading > span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #236653;
+  background: #e3f3ec;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.task-state-heading > span[data-status='paused'] {
+  color: #80611e;
+  background: #fff1c9;
+}
+
+.task-state-heading > div { min-width: 0; }
+.task-state-heading > div small { display: block; margin-bottom: 3px; color: #7a817e; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.task-state-heading > div strong { display: block; overflow-wrap: anywhere; }
+
+.task-stage-track {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin: 12px 0;
+}
+
+.task-stage-track span {
+  padding: 6px 4px;
+  border-radius: 7px;
+  color: #78817d;
+  background: #edf1ef;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.task-stage-track span.current {
+  color: white;
+  background: #2d806f;
+}
+
+.task-state-details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.task-state-details div { min-width: 0; }
+.task-state-details dt { color: #7a817e; font-size: 11px; }
+.task-state-details dd { margin: 3px 0 0; color: #28312e; font-size: 13px; }
+
 @media (max-width: 760px) {
   .page-shell {
     padding: 12px;
@@ -969,12 +1146,15 @@ textarea:disabled {
 
   .chat-sidebar {
     position: static;
+    max-height: none;
     min-height: 0;
   }
 
   .chat-list {
     max-height: 260px;
   }
+
+  .sidebar-task-list { max-height: 260px; }
 
   .chat-header {
     display: block;
@@ -1007,6 +1187,7 @@ textarea:disabled {
   .pending-memory-item { align-items: stretch; flex-direction: column; }
   .pending-memory-actions { align-self: stretch; }
   .pending-memory-actions button { flex: 1; }
+  .task-state-details { grid-template-columns: 1fr; }
 
   .config-summary,
   .window-stats,

@@ -22,6 +22,9 @@ test('reflection turns the whole task state into structured working memory', asy
         working: {
           goal: 'Сделать интерфейс удобным',
           state: 'Технические настройки скрыты',
+          stage: 'execution',
+          currentStep: 'Скрыть технические настройки',
+          expectedAction: 'Проверить мобильный вид',
           constraints: ['Интерфейс на русском'],
           decisions: ['Использовать прогрессивное раскрытие'],
           artifacts: ['client/src/App.tsx'],
@@ -34,7 +37,8 @@ test('reflection turns the whole task state into structured working memory', asy
   assert.match(prompt, /Доработать интерфейс/);
   assert.match(prompt, /Спрячь технические настройки/);
   assert.equal(reflection.working.goal, 'Сделать интерфейс удобным');
-  assert.equal(workingSummaryToWrites(reflection.working).length, 6);
+  assert.equal(reflection.working.stage, 'execution');
+  assert.equal(workingSummaryToWrites(reflection.working).length, 9);
 });
 
 test('automatic working summary is replaced while manual entries are preserved', async () => {
