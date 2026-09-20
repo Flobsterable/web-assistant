@@ -270,11 +270,7 @@ select {
 }
 
 .memory-panel { display: grid; gap: 12px; margin-bottom: 12px; border: 1px solid #d7e1e5; border-radius: 10px; padding: 14px; background: #fff; box-shadow: 0 6px 18px rgba(28, 43, 53, .035); }
-.memory-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
-.memory-heading > div { min-width: 0; }
-.memory-heading > div > span { display: block; color: #71808a; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
-.memory-heading strong { display: block; margin-top: 3px; color: #253540; font-size: 15px; }
-.memory-heading p { max-width: 720px; margin: 5px 0 0; color: #71808a; font-size: 11px; line-height: 1.45; }
+.memory-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .memory-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; flex-shrink: 0; border: 1px solid #c7d2d8; border-radius: 7px; padding: 0 11px; color: #2e3d48; background: #fff; cursor: pointer; font-size: 11px; font-weight: 800; }
 .memory-toggle:hover { border-color: #2d806f; color: #246c5f; background: #f6fbf9; }
 .memory-toggle span { font-size: 12px; }
@@ -284,19 +280,28 @@ select {
 .memory-summary span { font-size: 10px; }
 .memory-summary .attention { color: #7b591d; background: #fff4dc; }
 .memory-summary .attention strong { color: #9b6611; }
-.memory-switches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.memory-switches label { display: flex; align-items: center; gap: 10px; border: 1px solid #dce5e8; border-radius: 8px; padding: 9px 10px; background: #fbfcfc; cursor: pointer; }
-.memory-switch-copy { min-width: 0; flex: 1; }
-.memory-switch-copy strong, .memory-switch-copy small { display: block; }
-.memory-switch-copy strong { color: #253540; font-size: 11px; }
-.memory-switch-copy small { margin-top: 2px; color: #87949c; font-size: 10px; }
-.memory-switches input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.memory-switch-control { position: relative; width: 34px; height: 20px; flex: 0 0 34px; border-radius: 999px; background: #bdc8ce; transition: background .18s ease; }
-.memory-switch-control::after { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(24, 39, 49, .25); content: ''; transition: transform .18s ease; }
-.memory-switches input:checked + .memory-switch-control { background: #2d806f; }
-.memory-switches input:checked + .memory-switch-control::after { transform: translateX(14px); }
-.memory-switches input:focus-visible + .memory-switch-control { outline: 3px solid rgba(45, 128, 111, .2); outline-offset: 2px; }
+.memory-switches { display: flex; flex-wrap: wrap; gap: 6px; }
+.profile-selector { display: flex; align-items: end; gap: 8px; border: 1px solid #d8e6e1; border-radius: 8px; padding: 10px; background: #f5fbf9; }
+.profile-selector label { display: flex; flex: 1; align-items: center; justify-content: space-between; gap: 12px; }
+.profile-selector label span, .profile-selector label small { display: block; }
+.profile-selector label strong { color: #253540; font-size: 12px; }
+.profile-selector label small { margin-top: 3px; color: #71808a; font-size: 10px; }
+.profile-selector select { min-width: 180px; min-height: 36px; border: 1px solid #b9cec7; border-radius: 7px; padding: 0 9px; background: #fff; }
+.profile-selector button, .profile-form button { min-height: 36px; border: 0; border-radius: 7px; padding: 0 12px; color: #fff; background: #2d806f; cursor: pointer; font-size: 11px; font-weight: 800; }
+.memory-switches button { display: inline-flex; align-items: center; gap: 7px; min-height: 30px; border: 1px solid #dce5e8; border-radius: 999px; padding: 4px 7px 4px 10px; color: #52636e; background: #fbfcfc; cursor: pointer; }
+.memory-switches button strong { font-size: 10px; }
+.memory-switches button:hover { border-color: #b9cec7; background: #f5fbf9; }
+.memory-switch-control { position: relative; width: 28px; height: 16px; flex: 0 0 28px; border-radius: 999px; background: #bdc8ce; transition: background .18s ease; }
+.memory-switch-control::after { position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(24, 39, 49, .25); content: ''; transition: transform .18s ease; }
+.memory-switches button[aria-checked="true"] .memory-switch-control { background: #2d806f; }
+.memory-switches button[aria-checked="true"] .memory-switch-control::after { transform: translateX(12px); }
+.memory-switches button:focus-visible { outline: 3px solid rgba(45, 128, 111, .2); outline-offset: 2px; }
 .memory-settings { display: grid; gap: 12px; border-top: 1px solid #e2e8eb; padding-top: 12px; }
+.profile-editor { display: grid; gap: 10px; border-bottom: 1px solid #e2e8eb; padding-bottom: 14px; }
+.profile-form { display: grid; grid-template-columns: 140px minmax(220px, 1.3fr) 1fr 1fr minmax(220px, 1.2fr) auto; gap: 8px; align-items: end; }
+.profile-form label { display: grid; gap: 5px; color: #52636e; font-size: 10px; font-weight: 700; }
+.profile-form input, .profile-form textarea { width: 100%; min-height: 38px; border: 1px solid #c7d2d8; border-radius: 7px; padding: 8px 10px; color: #253540; background: #f8fafb; font: inherit; font-size: 12px; resize: vertical; }
+.profile-form label small { font-weight: 500; }
 .memory-settings-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .memory-settings-heading strong { color: #253540; font-size: 12px; }
 .memory-settings-heading span { color: #87949c; font-size: 10px; }
@@ -993,10 +998,12 @@ textarea:disabled {
     grid-template-columns: 1fr;
   }
 
-  .memory-heading { align-items: start; flex-direction: column; gap: 6px; }
+  .memory-toolbar { align-items: stretch; flex-direction: column; }
   .memory-toggle { width: 100%; justify-content: space-between; }
-  .memory-entry-groups, .memory-form { grid-template-columns: 1fr; }
+  .memory-entry-groups, .memory-form, .profile-form { grid-template-columns: 1fr; }
   .memory-switches { grid-template-columns: 1fr; }
+  .profile-selector, .profile-selector label { align-items: stretch; flex-direction: column; }
+  .profile-selector select { width: 100%; }
   .pending-memory-item { align-items: stretch; flex-direction: column; }
   .pending-memory-actions { align-self: stretch; }
   .pending-memory-actions button { flex: 1; }

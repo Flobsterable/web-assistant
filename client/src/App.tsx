@@ -46,6 +46,19 @@ type AppConfig = {
   error?: string;
 };
 
+type UserProfile = {
+  id: string;
+  name: string;
+  context: string;
+  style: string;
+  format: string;
+  constraints: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ProfilesResponse = { profiles: UserProfile[] };
+
 type ChatMessage = {
   id: string;
   role: 'user' | 'agent';
@@ -137,6 +150,12 @@ type ContextManagementReport = {
     longTermTokens: number;
     appliedWorkingIds: string[];
     appliedLongTermIds: string[];
+  };
+  personalization: {
+    profileId: string;
+    profileName: string;
+    applied: boolean;
+    tokens: number;
   };
 };
 
@@ -326,6 +345,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             <span>Экономия: {message.meta.contextManagement.savedInputPercent}%</span>
             <span>Память задачи: {message.meta.contextManagement.memory.appliedWorkingIds.length}</span>
             <span>Долгая память: {message.meta.contextManagement.memory.appliedLongTermIds.length}</span>
+            <span>Профиль: {message.meta.contextManagement.personalization.applied ? message.meta.contextManagement.personalization.profileName : 'не применён'}</span>
             <span>Рабочая: {message.meta.contextManagement.memory.workingEnabled ? 'включена' : 'выключена'}</span>
             <span>Долговременная: {message.meta.contextManagement.memory.longTermEnabled ? 'включена' : 'выключена'}</span>
             <span>Стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
@@ -377,11 +397,32 @@ export default function App() {
   const [useWorkingMemory, setUseWorkingMemory] = useState(() => readMemoryToggle('use-working-memory'));
   const [useLongTermMemory, setUseLongTermMemory] = useState(() => readMemoryToggle('use-long-term-memory'));
   const [selectedModelId, setSelectedModelId] = useState(() => window.localStorage.getItem('agent-model-id') ?? 'flash');
+  const [profiles, setProfiles] = useState<UserProfile[]>([]);
+  const [selectedProfileId, setSelectedProfileId] = useState(() => window.localStorage.getItem('agent-profile-id') ?? 'default');
+  const [isCreatingProfile, setIsCreatingProfile] = useState(false);
+  const [profileName, setProfileName] = useState('');
+  const [profileContext, setProfileContext] = useState('');
+  const [profileStyle, setProfileStyle] = useState('');
+  const [profileFormat, setProfileFormat] = useState('');
+  const [profileConstraints, setProfileConstraints] = useState('');
 
   const selectedModel = useMemo(
     () => config?.models.find((model) => model.id === selectedModelId) ?? config?.models[0],
     [config, selectedModelId]
   );
+  const selectedProfile = useMemo(
+    () => profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0],
+    [profiles, selectedProfileId]
+  );
+
+  useEffect(() => {
+    if (!selectedProfile || isCreatingProfile) return;
+    setProfileName(selectedProfile.name);
+    setProfileContext(selectedProfile.context);
+    setProfileStyle(selectedProfile.style);
+    setProfileFormat(selectedProfile.format);
+    setProfileConstraints(selectedProfile.constraints.join('\n'));
+  }, [selectedProfile, isCreatingProfile]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -389,12 +430,14 @@ export default function App() {
     async function loadInitialData() {
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
-        const [configResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse] = await Promise.all([
+        const memoryQuery = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
+        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
+          fetch('/api/profiles', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
           fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
-          fetch(`/api/agent/memory?${sessionQuery}`, { signal: controller.signal }),
-          fetch(`/api/agent/memory/pending?${sessionQuery}`, { signal: controller.signal })
+          fetch(`/api/agent/memory?${memoryQuery}`, { signal: controller.signal }),
+          fetch(`/api/agent/memory/pending?${memoryQuery}`, { signal: controller.signal })
         ]);
         const data = (await configResponse.json()) as AppConfig;
 
@@ -403,6 +446,14 @@ export default function App() {
         }
 
         setConfig(data);
+        if (profilesResponse.ok) {
+          const loadedProfiles = ((await profilesResponse.json()) as ProfilesResponse).profiles;
+          setProfiles(loadedProfiles);
+          if (!loadedProfiles.some((profile) => profile.id === selectedProfileId)) {
+            setSelectedProfileId('default');
+            window.localStorage.setItem('agent-profile-id', 'default');
+          }
+        }
         const savedModelId = window.localStorage.getItem('agent-model-id');
         const nextModel = data.models.find((model) => model.id === savedModelId)
           ?? data.models.find((model) => model.id === 'flash')
@@ -450,7 +501,7 @@ export default function App() {
 
     void loadInitialData();
     return () => controller.abort();
-  }, [sessionId]);
+  }, [sessionId, selectedProfileId]);
 
   function openChat(nextSessionId: string, options?: { replace?: boolean }) {
     const nextUrl = new URL(window.location.href);
@@ -525,7 +576,7 @@ export default function App() {
   }
 
   async function refreshMemory() {
-    const query = new URLSearchParams({ sessionId }).toString();
+    const query = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
     const [response, pendingResponse] = await Promise.all([
       fetch(`/api/agent/memory?${query}`),
       fetch(`/api/agent/memory/pending?${query}`)
@@ -539,7 +590,7 @@ export default function App() {
     setError('');
     try {
       const response = await fetch(`/api/agent/memory/pending/${encodeURIComponent(id)}/${action}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId })
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, profileId: selectedProfileId })
       });
       const data = (await response.json()) as { error?: string };
       if (!response.ok) throw new Error(data.error ?? 'Не удалось обработать предложение памяти.');
@@ -560,6 +611,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId,
+          profileId: selectedProfileId,
           layer: memoryLayer,
           category: memoryCategory,
           key: memoryKey,
@@ -580,13 +632,50 @@ export default function App() {
 
   async function handleDeleteMemory(layer: MemoryLayer, id: string) {
     setError('');
-    const query = new URLSearchParams({ sessionId }).toString();
+    const query = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
     try {
       const response = await fetch(`/api/agent/memory/${layer}/${encodeURIComponent(id)}?${query}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Не удалось удалить запись памяти.');
       await refreshMemory();
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Не удалось удалить запись памяти.');
+    }
+  }
+
+  function handleNewProfile() {
+    setIsMemoryOpen(true);
+    setIsCreatingProfile(true);
+    setProfileName('');
+    setProfileContext('');
+    setProfileStyle('');
+    setProfileFormat('');
+    setProfileConstraints('');
+  }
+
+  async function handleSaveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError('');
+    const body = {
+      name: profileName,
+      context: profileContext,
+      style: profileStyle,
+      format: profileFormat,
+      constraints: profileConstraints.split('\n').map((item) => item.trim()).filter(Boolean)
+    };
+    try {
+      const response = await fetch(isCreatingProfile ? '/api/profiles' : `/api/profiles/${encodeURIComponent(selectedProfileId)}`, {
+        method: isCreatingProfile ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = (await response.json()) as { profile?: UserProfile; error?: string };
+      if (!response.ok || !data.profile) throw new Error(data.error ?? 'Не удалось сохранить профиль.');
+      setProfiles((current) => [...current.filter((profile) => profile.id !== data.profile?.id), data.profile as UserProfile]);
+      setSelectedProfileId(data.profile.id);
+      window.localStorage.setItem('agent-profile-id', data.profile.id);
+      setIsCreatingProfile(false);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось сохранить профиль.');
     }
   }
 
@@ -621,6 +710,7 @@ export default function App() {
         body: JSON.stringify({
           message: trimmedMessage,
           sessionId,
+          profileId: selectedProfileId,
           modelId: selectedModel?.id,
           useWorkingMemory,
           useLongTermMemory
@@ -760,11 +850,12 @@ export default function App() {
           )}
 
           <section className="memory-panel" aria-label="Память агента">
-            <div className="memory-heading">
-              <div>
-                <span>Память агента</span>
-                <strong>Агент помнит важное</strong>
-                <p>Свежие сообщения остаются в окне, задача сжимается в рабочий контекст, а важные сведения профиля агент запоминает автоматически.</p>
+            <div className="memory-toolbar">
+              <div className="memory-summary" aria-label="Состояние памяти">
+                <div><strong>{memory?.layers.shortTerm.messages.length ?? messages.length}</strong><span>сообщений</span></div>
+                <div><strong>{memory?.layers.working.entries.length ? 'Готов' : '—'}</strong><span>контекст</span></div>
+                <div><strong>{memory?.layers.longTerm.entries.length ?? 0}</strong><span>надолго</span></div>
+                {pendingMemory.length > 0 && <div className="attention"><strong>{pendingMemory.length}</strong><span>ждёт решения</span></div>}
               </div>
               <button
                 className="memory-toggle"
@@ -772,51 +863,57 @@ export default function App() {
                 aria-expanded={isMemoryOpen}
                 onClick={() => setIsMemoryOpen((isOpen) => !isOpen)}
               >
-                {isMemoryOpen ? 'Скрыть настройки' : 'Управление памятью'}
+                {isMemoryOpen ? 'Скрыть' : 'Настройки'}
                 <span aria-hidden="true">{isMemoryOpen ? '↑' : '↓'}</span>
               </button>
             </div>
 
-            <div className="memory-summary" aria-label="Состояние памяти">
-              <div><strong>{memory?.layers.shortTerm.messages.length ?? messages.length}</strong><span>сообщений в чате</span></div>
-              <div><strong>{memory?.layers.working.entries.length ? 'Готов' : '—'}</strong><span>контекст задачи</span></div>
-              <div><strong>{memory?.layers.longTerm.entries.length ?? 0}</strong><span>сохранено надолго</span></div>
-              {pendingMemory.length > 0 && <div className="attention"><strong>{pendingMemory.length}</strong><span>ждёт решения</span></div>}
+            <div className="profile-selector">
+              <label>
+                <span><strong>Профиль пользователя</strong><small>Данные о человеке и его предпочтения</small></span>
+                <select
+                  value={selectedProfileId}
+                  onChange={(event) => {
+                    setIsCreatingProfile(false);
+                    setSelectedProfileId(event.target.value);
+                    window.localStorage.setItem('agent-profile-id', event.target.value);
+                  }}
+                >
+                  {profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
+                </select>
+              </label>
+              <button type="button" onClick={handleNewProfile}>Новый пользователь</button>
             </div>
 
             <div className="memory-switches" aria-label="Использование памяти в ответах">
-              <label>
-                <span className="memory-switch-copy">
-                  <strong>Рабочая память</strong>
-                  <small>Сжатый контекст текущей задачи</small>
-                </span>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={useWorkingMemory}
-                  onChange={(event) => {
-                    setUseWorkingMemory(event.target.checked);
-                    window.localStorage.setItem('use-working-memory', String(event.target.checked));
-                  }}
-                />
+              <button
+                type="button"
+                role="switch"
+                aria-checked={useWorkingMemory}
+                title="Сжатый контекст текущей задачи"
+                onClick={() => {
+                  const nextValue = !useWorkingMemory;
+                  setUseWorkingMemory(nextValue);
+                  window.localStorage.setItem('use-working-memory', String(nextValue));
+                }}
+              >
+                <strong>Рабочая</strong>
                 <span className="memory-switch-control" aria-hidden="true" />
-              </label>
-              <label>
-                <span className="memory-switch-copy">
-                  <strong>Долговременная память</strong>
-                  <small>Персональные сведения из всех чатов</small>
-                </span>
-                <input
-                  type="checkbox"
-                  role="switch"
-                  checked={useLongTermMemory}
-                  onChange={(event) => {
-                    setUseLongTermMemory(event.target.checked);
-                    window.localStorage.setItem('use-long-term-memory', String(event.target.checked));
-                  }}
-                />
+              </button>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={useLongTermMemory}
+                title="Персональные сведения из всех чатов"
+                onClick={() => {
+                  const nextValue = !useLongTermMemory;
+                  setUseLongTermMemory(nextValue);
+                  window.localStorage.setItem('use-long-term-memory', String(nextValue));
+                }}
+              >
+                <strong>Долговременная</strong>
                 <span className="memory-switch-control" aria-hidden="true" />
-              </label>
+              </button>
             </div>
 
             {pendingMemory.length > 0 && (
@@ -841,6 +938,20 @@ export default function App() {
 
             {isMemoryOpen && (
               <div className="memory-settings">
+                <div className="profile-editor">
+                  <div className="memory-settings-heading">
+                    <strong>{isCreatingProfile ? 'Новый пользователь' : `Пользователь: ${selectedProfile?.name ?? ''}`}</strong>
+                    <span>Личные сведения и предпочтения пользователя</span>
+                  </div>
+                  <form className="profile-form" onSubmit={handleSaveProfile}>
+                    <label>Имя пользователя<input value={profileName} onChange={(event) => setProfileName(event.target.value)} required maxLength={80} placeholder="Например: Александр" /></label>
+                    <label className="profile-context">О пользователе <small>Роль, опыт, сфера, интересы и цели</small><textarea value={profileContext} onChange={(event) => setProfileContext(event.target.value)} rows={3} maxLength={4000} required placeholder="Например: frontend-разработчик, изучает React, работает над SaaS-продуктом" /></label>
+                    <label>Как удобно получать ответы <small>необязательно</small><input value={profileStyle} onChange={(event) => setProfileStyle(event.target.value)} maxLength={1000} placeholder="Например: кратко и нейтрально" /></label>
+                    <label>Предпочтительный формат <small>необязательно</small><input value={profileFormat} onChange={(event) => setProfileFormat(event.target.value)} maxLength={1000} placeholder="Например: 3–5 пунктов" /></label>
+                    <label className="profile-constraints">Что учитывать <small>необязательно, по одному на строку</small><textarea value={profileConstraints} onChange={(event) => setProfileConstraints(event.target.value)} rows={3} placeholder="Не любит эмодзи" /></label>
+                    <button type="submit">{isCreatingProfile ? 'Создать пользователя' : 'Сохранить'}</button>
+                  </form>
+                </div>
                 <div className="memory-settings-heading">
                   <strong>Добавить вручную</strong>
                   <span>Для опытных пользователей</span>
@@ -874,22 +985,25 @@ export default function App() {
                   <button type="submit" disabled={isSavingMemory}>{isSavingMemory ? 'Сохраняю…' : 'Добавить'}</button>
                 </form>
 
-                <div className="memory-entry-groups">
-                  {(['working', 'long-term'] as const).map((layer) => {
-                    const entries = layer === 'working' ? memory?.layers.working.entries : memory?.layers.longTerm.entries;
-                    return (
-                      <div className="memory-entry-group" key={layer}>
-                        <strong>{layer === 'working' ? 'Для этой задачи' : 'Для всех чатов'}</strong>
-                        {!entries?.length ? <span className="memory-empty">Пока ничего не сохранено</span> : entries.map((entry) => (
-                          <div className="memory-entry" key={entry.id}>
-                            <div><span>{memoryCategoryTitle(entry.category)}</span><b>{memoryKeyTitle(entry.key)}</b><p>{entry.value}</p></div>
-                            <button type="button" onClick={() => void handleDeleteMemory(layer, entry.id)} aria-label={`Удалить ${entry.key}`}>Удалить</button>
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  })}
-                </div>
+                {Boolean(memory?.layers.working.entries.length || memory?.layers.longTerm.entries.length) && (
+                  <div className="memory-entry-groups">
+                    {(['working', 'long-term'] as const).map((layer) => {
+                      const entries = layer === 'working' ? memory?.layers.working.entries : memory?.layers.longTerm.entries;
+                      if (!entries?.length) return null;
+                      return (
+                        <div className="memory-entry-group" key={layer}>
+                          <strong>{layer === 'working' ? 'Для этой задачи' : 'Для всех чатов'}</strong>
+                          {entries.map((entry) => (
+                            <div className="memory-entry" key={entry.id}>
+                              <div><span>{memoryCategoryTitle(entry.category)}</span><b>{memoryKeyTitle(entry.key)}</b><p>{entry.value}</p></div>
+                              <button type="button" onClick={() => void handleDeleteMemory(layer, entry.id)} aria-label={`Удалить ${entry.key}`}>Удалить</button>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </section>

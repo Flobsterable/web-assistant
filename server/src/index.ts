@@ -16,6 +16,7 @@ import { JsonAgentMemoryStore, MemoryLayer, type MemoryEvent, validateMemoryWrit
 import { approveMemorySuggestion, applyMemoryPolicy, rejectMemorySuggestion } from './memory-policy.js';
 import { reflectConversationMemory, workingSummaryToWrites } from './memory-reflector.js';
 import { JsonPendingMemoryStore } from './pending-memory.js';
+import { JsonUserProfileStore, normalizeProfileId, validateUserProfileInput, type UserProfile } from './profile.js';
 import { AgentTurnLogger, listAgentLogs, readAgentLog } from './agent-log.js';
 import {
   buildTokenDemo,
@@ -134,6 +135,7 @@ type CompareRequest = {
 type AgentRequest = {
   message: string;
   sessionId?: string;
+  profileId: string;
   modelId?: string;
   useWorkingMemory: boolean;
   useLongTermMemory: boolean;
@@ -361,6 +363,7 @@ const agentSessionsPath = path.join(agentDataPath, 'agent-sessions');
 const workingMemoryPath = path.join(agentDataPath, 'memory', 'working');
 const longTermMemoryPath = path.join(agentDataPath, 'memory', 'long-term');
 const pendingMemoryPath = path.join(agentDataPath, 'memory', 'pending');
+const profilesPath = path.join(agentDataPath, 'profiles');
 const agentLogsPath = path.join(agentDataPath, 'agent-logs');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
@@ -385,12 +388,13 @@ function readAgentRequest(body: unknown): AgentRequest | string {
   const candidate = body as Record<string, unknown>;
   const message = typeof candidate.message === 'string' ? candidate.message.trim() : '';
   const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
+  const profileId = normalizeProfileId(candidate.profileId);
   const modelId = typeof candidate.modelId === 'string' ? candidate.modelId.trim() : undefined;
   const useWorkingMemory = candidate.useWorkingMemory !== false;
   const useLongTermMemory = candidate.useLongTermMemory !== false;
   if (!message) return 'Message is required.';
 
-  return { message, sessionId: normalizeSessionId(rawSessionId), modelId, useWorkingMemory, useLongTermMemory };
+  return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useWorkingMemory, useLongTermMemory };
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -576,6 +580,10 @@ function readSessionIdFromRequest(req: Request) {
   return normalizeSessionId(typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined);
 }
 
+function readProfileIdFromRequest(req: Request) {
+  return normalizeProfileId(typeof req.query.profileId === 'string' ? req.query.profileId : undefined);
+}
+
 function createSessionTitle(sessionId: string) {
   if (sessionId === defaultAgentSessionId) return 'Главное окно';
   if (sessionId.includes('-ui-')) return `UI ветка ${sessionId.slice(-8)}`;
@@ -606,12 +614,14 @@ function createAgentConversationStore(sessionId: string) {
   return new JsonConversationStore(path.join(agentSessionsPath, `${sessionId}.json`));
 }
 
-function createAgentMemoryStore(sessionId: string) {
+function createAgentMemoryStore(sessionId: string, profileId = defaultProfileId) {
   return new JsonAgentMemoryStore(
     path.join(workingMemoryPath, `${sessionId}.json`),
-    path.join(longTermMemoryPath, `${defaultProfileId}.json`)
+    path.join(longTermMemoryPath, `${normalizeProfileId(profileId)}.json`)
   );
 }
+
+const userProfileStore = new JsonUserProfileStore(profilesPath);
 
 function createPendingMemoryStore(sessionId: string) {
   return new JsonPendingMemoryStore(path.join(pendingMemoryPath, `${sessionId}.json`));
@@ -801,7 +811,8 @@ async function listAgentChats(agentModel: ModelConfig): Promise<PublicAgentChat[
 function createAgent(
   agentModel: ModelConfig,
   sessionId: string,
-  memoryUsage?: { working: boolean; longTerm: boolean }
+  memoryUsage?: { working: boolean; longTerm: boolean },
+  userProfile?: UserProfile
 ) {
   return new SimpleAgent({
     name: 'Simple LLM Agent',
@@ -811,7 +822,8 @@ function createAgent(
     modelTitle: agentModel.title,
     model: agentModel.model,
     conversationStore: createAgentConversationStore(sessionId),
-    memoryStore: createAgentMemoryStore(sessionId),
+    memoryStore: createAgentMemoryStore(sessionId, userProfile?.id),
+    userProfile,
     tokenPricing: createTokenPricing(agentModel),
     tokenBudget: createTokenBudget(agentModel),
     maxContextMessages: readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? undefined,
@@ -856,12 +868,53 @@ app.get('/api/agent/history', async (req: Request, res: Response) => {
   }
 });
 
+app.get('/api/profiles', async (_req: Request, res: Response) => {
+  try {
+    return res.json({ profiles: await userProfileStore.list() });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load profiles.' });
+  }
+});
+
+app.post('/api/profiles', async (req: Request, res: Response) => {
+  const input = validateUserProfileInput(req.body);
+  if (typeof input === 'string') return res.status(400).json({ error: input });
+  try {
+    return res.status(201).json({ profile: await userProfileStore.save(input) });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save profile.' });
+  }
+});
+
+app.put('/api/profiles/:id', async (req: Request, res: Response) => {
+  const input = validateUserProfileInput(req.body);
+  if (typeof input === 'string') return res.status(400).json({ error: input });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    return res.json({ profile: await userProfileStore.save(input, id) });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update profile.' });
+  }
+});
+
+app.delete('/api/profiles/:id', async (req: Request, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    await userProfileStore.remove(id);
+    return res.status(204).send();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to delete profile.';
+    return res.status(message.includes('Default') ? 400 : 500).json({ error: message });
+  }
+});
+
 app.get('/api/agent/memory', async (req: Request, res: Response) => {
   const sessionId = readSessionIdFromRequest(req);
+  const profileId = readProfileIdFromRequest(req);
 
   try {
     const [snapshot, shortTerm] = await Promise.all([
-      createAgentMemoryStore(sessionId).load(),
+      createAgentMemoryStore(sessionId, profileId).load(),
       createAgentConversationStore(sessionId).load()
     ]);
     return res.json({
@@ -879,8 +932,8 @@ app.get('/api/agent/memory', async (req: Request, res: Response) => {
         },
         longTerm: {
           scope: 'all-dialogues',
-          profileId: defaultProfileId,
-          storage: `memory/long-term/${defaultProfileId}.json`,
+          profileId,
+          storage: `memory/long-term/${profileId}.json`,
           entries: snapshot.longTerm
         }
       }
@@ -895,9 +948,10 @@ app.post('/api/agent/memory', async (req: Request, res: Response) => {
   const write = validateMemoryWrite(req.body);
   if (typeof write === 'string') return res.status(400).json({ error: write });
   const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
+  const profileId = normalizeProfileId(req.body?.profileId);
 
   try {
-    const entry = await createAgentMemoryStore(sessionId).upsert({ ...write, source: 'manual' });
+    const entry = await createAgentMemoryStore(sessionId, profileId).upsert({ ...write, source: 'manual' });
     return res.status(201).json({ entry, explicit: true });
   } catch (error) {
     console.error(error);
@@ -910,9 +964,10 @@ app.delete('/api/agent/memory/:layer/:id', async (req: Request, res: Response) =
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   if (layer !== 'working' && layer !== 'long-term') return res.status(400).json({ error: 'Invalid memory layer.' });
   const sessionId = readSessionIdFromRequest(req);
+  const profileId = readProfileIdFromRequest(req);
 
   try {
-    await createAgentMemoryStore(sessionId).remove(layer, id);
+    await createAgentMemoryStore(sessionId, profileId).remove(layer, id);
     return res.status(204).send();
   } catch (error) {
     console.error(error);
@@ -922,8 +977,10 @@ app.delete('/api/agent/memory/:layer/:id', async (req: Request, res: Response) =
 
 app.get('/api/agent/memory/pending', async (req: Request, res: Response) => {
   const sessionId = readSessionIdFromRequest(req);
+  const profileId = readProfileIdFromRequest(req);
   try {
-    return res.json({ sessionId, suggestions: await createPendingMemoryStore(sessionId).list() });
+    const suggestions = (await createPendingMemoryStore(sessionId).list()).filter((suggestion) => suggestion.profileId === profileId);
+    return res.json({ sessionId, profileId, suggestions });
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load pending memory.' });
   }
@@ -934,8 +991,11 @@ app.post('/api/agent/memory/pending/:id/approve', async (req: Request, res: Resp
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
   try {
+    const pendingStore = createPendingMemoryStore(sessionId);
+    const suggestion = (await pendingStore.list()).find((item) => item.id === id);
+    if (!suggestion) return res.status(404).json({ error: 'Pending memory suggestion not found.' });
     const event = await logger.step('memory_persist', () =>
-      approveMemorySuggestion(id, createAgentMemoryStore(sessionId), createPendingMemoryStore(sessionId))
+      approveMemorySuggestion(id, createAgentMemoryStore(sessionId, suggestion.profileId), pendingStore)
     );
     if (!event) return res.status(404).json({ error: 'Pending memory suggestion not found.' });
     await logger.annotate('memory_persist', { memoryEvents: [event] });
@@ -1168,14 +1228,18 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   }
 
   const sessionId = normalizeSessionId(request.sessionId);
+  const userProfile = await userProfileStore.get(request.profileId);
+  if (!userProfile) {
+    return res.status(400).json({ error: `Профиль ${request.profileId} не найден.` });
+  }
   const agent = createAgent(agentModel, sessionId, {
     working: request.useWorkingMemory,
     longTerm: request.useLongTermMemory
-  });
+  }, userProfile);
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
 
   try {
-    const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId).load());
+    const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId, request.profileId).load());
     await logger.step('context_assembly', async () => { await agent.inspectNextRun(request.message); });
     const result = await logger.step('provider_request', () => agent.run(request.message), {
       provider: agentDefinition.provider,
@@ -1201,10 +1265,10 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     }
     const policyEvents = await logger.step('memory_policy', () => applyMemoryPolicy(reflection?.longTermCandidates ?? [], {
       sessionId,
-      profileId: defaultProfileId,
+      profileId: request.profileId,
       confidenceThreshold: readMemoryConfidenceThreshold(),
       longTermAutoSaveThreshold: readProfileAutoSaveThreshold(),
-      memoryStore: createAgentMemoryStore(sessionId),
+      memoryStore: createAgentMemoryStore(sessionId, request.profileId),
       pendingStore: createPendingMemoryStore(sessionId)
     }));
     await logger.annotate('memory_policy', { memoryEvents: policyEvents });
@@ -1213,7 +1277,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       type: 'updated', scope: 'working', reason: 'Сжатый контекст текущей задачи обновлён.', createdAt: new Date().toISOString()
     } : null;
     await logger.step('memory_persist', async () => {
-      if (reflection) await createAgentMemoryStore(sessionId).replaceAgentWorking(workingWrites);
+      if (reflection) await createAgentMemoryStore(sessionId, request.profileId).replaceAgentWorking(workingWrites);
     }, { memoryEvents: workingEvent ? [workingEvent, ...policyEvents] : policyEvents });
     const memoryEvents = workingEvent ? [workingEvent, ...policyEvents] : policyEvents;
     return res.json({
@@ -1221,6 +1285,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       turnId: logger.turnId,
       memoryReflection: reflection,
       memoryEvents,
+      profile: userProfile,
       session: {
         sessionId,
         title: createChatTitle(history, sessionId)

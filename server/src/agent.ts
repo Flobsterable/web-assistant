@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AgentMemoryStore, MemoryEntry, MemorySnapshot } from './memory.js';
+import { createUserProfileMessage, defaultUserProfile, type UserProfile } from './profile.js';
 import type { AgentTokenReport, TokenBudget, TokenPricing } from './token-meter.js';
 import {
   createTokenReport,
@@ -43,6 +44,12 @@ export type ConversationContextReport = {
     appliedWorkingIds: string[];
     appliedLongTermIds: string[];
     dropped: Array<{ id: string; layer: 'working' | 'long-term'; reason: string }>;
+  };
+  personalization: {
+    profileId: string;
+    profileName: string;
+    applied: boolean;
+    tokens: number;
   };
 };
 
@@ -102,6 +109,7 @@ type SimpleAgentOptions = {
   keepLastMessages?: number;
   useWorkingMemory?: boolean;
   useLongTermMemory?: boolean;
+  userProfile?: UserProfile;
 };
 
 type PersistedConversation = {
@@ -235,6 +243,7 @@ export class SimpleAgent {
   private readonly keepLastMessages: number;
   private readonly useWorkingMemory: boolean;
   private readonly useLongTermMemory: boolean;
+  private readonly userProfile: UserProfile;
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -253,6 +262,7 @@ export class SimpleAgent {
     this.keepLastMessages = normalizePositiveInteger(options.keepLastMessages, 5);
     this.useWorkingMemory = options.useWorkingMemory ?? true;
     this.useLongTermMemory = options.useLongTermMemory ?? true;
+    this.userProfile = options.userProfile ?? defaultUserProfile;
   }
 
   async history() {
@@ -371,10 +381,12 @@ export class SimpleAgent {
     const exactMessages = this.selectMessagesForContext(history.slice(-this.keepLastMessages), nextUserMessage);
     const activeLongTerm = this.useLongTermMemory ? memory.longTerm : [];
     const activeWorking = this.useWorkingMemory ? memory.working : [];
+    const profileMessage = createUserProfileMessage(this.userProfile);
     const longTermMessages = createMemoryMessages('long-term', activeLongTerm);
     const workingMessages = createMemoryMessages('working', activeWorking);
-    const messages = [...longTermMessages, ...workingMessages, ...exactMessages.map(toAgentMessage)];
+    const messages = [profileMessage, ...longTermMessages, ...workingMessages, ...exactMessages.map(toAgentMessage)];
     const priorities = [
+      5,
       ...longTermMessages.map(() => 1),
       ...activeWorking
         .slice()
@@ -434,8 +446,16 @@ export class SimpleAgent {
       estimateMessageTokens({ role: 'system', content: this.systemPrompt }) +
       estimateMessageTokens({ role: 'user', content: nextUserMessage });
 
+    messages.forEach((message, index) => {
+      if ((priorities[index] ?? 0) >= 5) {
+        selectedIndexes.add(index);
+        tokenCount += estimateMessageTokens(message);
+      }
+    });
+
     const candidates = messages
       .map((message, index) => ({ message, index, priority: priorities[index] ?? 0 }))
+      .filter(({ index }) => !selectedIndexes.has(index))
       .sort((left, right) => right.priority - left.priority || right.index - left.index);
 
     for (const { message, index } of candidates) {
@@ -463,6 +483,7 @@ export class SimpleAgent {
     const selectedHistoryTokens = estimateMessagesTokens(params.contextMessages);
     const workingMessages = createMemoryMessages('working', params.memory.working);
     const longTermMessages = createMemoryMessages('long-term', params.memory.longTerm);
+    const profileMessage = createUserProfileMessage(this.userProfile);
     const appliedWorkingIds = memoryIdsPresentInContext(params.contextMessages, params.memory.working);
     const appliedLongTermIds = memoryIdsPresentInContext(params.contextMessages, params.memory.longTerm);
     const dropped = [
@@ -473,7 +494,8 @@ export class SimpleAgent {
         .filter((entry) => !appliedLongTermIds.includes(entry.id))
         .map((entry) => ({ id: entry.id, layer: 'long-term' as const, reason: this.useLongTermMemory ? 'context_token_budget' : 'layer_disabled' }))
     ];
-    const uncompressedInputTokens = systemPromptTokens + fullHistoryTokens + currentRequestTokens;
+    const profileTokens = estimateMessageTokens(profileMessage);
+    const uncompressedInputTokens = systemPromptTokens + profileTokens + fullHistoryTokens + currentRequestTokens;
     const managedInputTokens = systemPromptTokens + selectedHistoryTokens + currentRequestTokens;
     const savedInputTokens = Math.max(0, uncompressedInputTokens - managedInputTokens);
 
@@ -498,6 +520,12 @@ export class SimpleAgent {
         appliedWorkingIds,
         appliedLongTermIds,
         dropped
+      },
+      personalization: {
+        profileId: this.userProfile.id,
+        profileName: this.userProfile.name,
+        applied: params.contextMessages.some((message) => message.content === profileMessage.content),
+        tokens: profileTokens
       }
     };
   }
