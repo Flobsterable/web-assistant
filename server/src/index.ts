@@ -9,14 +9,14 @@ import { fileURLToPath } from 'node:url';
 import {
   AgentContextOverflowError,
   AgentMessage,
-  ContextStrategy,
-  ConversationFacts,
-  createFactMessages,
   JsonConversationStore,
-  SimpleAgent,
-  StoredAgentMessage,
-  updateConversationFacts
+  SimpleAgent
 } from './agent.js';
+import { JsonAgentMemoryStore, MemoryLayer, type MemoryEvent, validateMemoryWrite } from './memory.js';
+import { approveMemorySuggestion, applyMemoryPolicy, rejectMemorySuggestion } from './memory-policy.js';
+import { reflectConversationMemory, workingSummaryToWrites } from './memory-reflector.js';
+import { JsonPendingMemoryStore } from './pending-memory.js';
+import { AgentTurnLogger, listAgentLogs, readAgentLog } from './agent-log.js';
 import {
   buildTokenDemo,
   calculateCost,
@@ -134,7 +134,9 @@ type CompareRequest = {
 type AgentRequest = {
   message: string;
   sessionId?: string;
-  contextStrategy?: ContextStrategy;
+  modelId?: string;
+  useWorkingMemory: boolean;
+  useLongTermMemory: boolean;
 };
 
 type PublicAgentMessage = {
@@ -156,11 +158,6 @@ type PublicAgentChat = PublicAgentWindow & {
   fullHistoryTokens: number;
   updatedAt: string | null;
   lastMessagePreview: string | null;
-};
-
-type BranchRequest = {
-  sessionId?: string;
-  checkpointMessageCount?: number;
 };
 
 type PublicRequestTokenMeta = {
@@ -324,6 +321,21 @@ function readModelConfigs() {
   ];
 }
 
+function readAvailableModelConfigs() {
+  const definitions: Array<[(typeof modelEnvPrefixes)[number], string, ModelConfig['provider']]> = [
+    ['MODEL_GEMINI', 'Слабая: Gemini 3.5 Flash-Lite', 'gemini'],
+    ['MODEL_FLASH', 'Средняя: DeepSeek V4 Flash', 'openai-compatible'],
+    ['MODEL_PRO', 'Сильная: DeepSeek V4 Pro', 'openai-compatible']
+  ];
+  return definitions.flatMap(([prefix, title, provider]) => {
+    try {
+      return [readModelConfig(prefix, title, provider)];
+    } catch {
+      return [];
+    }
+  });
+}
+
 function readAgentModelConfig() {
   return readModelConfig(agentDefinition.modelEnvPrefix, 'DeepSeek V4 Flash', 'openai-compatible');
 }
@@ -344,11 +356,13 @@ function readAgentTokenDemoConfig() {
   };
 }
 
-const defaultTask =
-  readOptionalTextEnv('DEFAULT_TASK') ??
-  'Объясни простыми словами, что такое градиентный бустинг, и приведи один пример применения.';
 const agentDataPath = path.resolve(__dirname, '../data');
 const agentSessionsPath = path.join(agentDataPath, 'agent-sessions');
+const workingMemoryPath = path.join(agentDataPath, 'memory', 'working');
+const longTermMemoryPath = path.join(agentDataPath, 'memory', 'long-term');
+const pendingMemoryPath = path.join(agentDataPath, 'memory', 'pending');
+const agentLogsPath = path.join(agentDataPath, 'agent-logs');
+const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 
 app.use(cors());
@@ -371,29 +385,12 @@ function readAgentRequest(body: unknown): AgentRequest | string {
   const candidate = body as Record<string, unknown>;
   const message = typeof candidate.message === 'string' ? candidate.message.trim() : '';
   const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
-  const contextStrategy = normalizeContextStrategy(candidate.contextStrategy);
-
+  const modelId = typeof candidate.modelId === 'string' ? candidate.modelId.trim() : undefined;
+  const useWorkingMemory = candidate.useWorkingMemory !== false;
+  const useLongTermMemory = candidate.useLongTermMemory !== false;
   if (!message) return 'Message is required.';
 
-  return { message, sessionId: normalizeSessionId(rawSessionId), contextStrategy };
-}
-
-function readBranchRequest(body: unknown): BranchRequest | string {
-  if (!body || typeof body !== 'object') return 'Request body is required.';
-
-  const candidate = body as Record<string, unknown>;
-  const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
-  const checkpointMessageCount =
-    typeof candidate.checkpointMessageCount === 'number' && Number.isFinite(candidate.checkpointMessageCount)
-      ? Math.max(0, Math.floor(candidate.checkpointMessageCount))
-      : undefined;
-
-  return { sessionId: normalizeSessionId(rawSessionId), checkpointMessageCount };
-}
-
-function normalizeContextStrategy(value: unknown): ContextStrategy {
-  if (value === 'sticky-facts' || value === 'branching' || value === 'sliding-window') return value;
-  return 'sliding-window';
+  return { message, sessionId: normalizeSessionId(rawSessionId), modelId, useWorkingMemory, useLongTermMemory };
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -587,13 +584,12 @@ function createSessionTitle(sessionId: string) {
 }
 
 function createChatTitle(history: Awaited<ReturnType<SimpleAgent['history']>>, sessionId: string) {
-  const branchPrefix = sessionId.includes('-ui-') ? 'UI ветка' : sessionId.includes('-api-') ? 'API ветка' : null;
   const firstUserMessage = history.find((message) => message.role === 'user');
   if (!firstUserMessage) return createSessionTitle(sessionId);
 
   const compactTitle = firstUserMessage.content.replace(/\s+/g, ' ').trim().slice(0, 42);
   const baseTitle = compactTitle || createSessionTitle(sessionId);
-  return branchPrefix ? `${branchPrefix} · ${baseTitle}` : baseTitle;
+  return baseTitle;
 }
 
 function createLastMessagePreview(history: Awaited<ReturnType<SimpleAgent['history']>>) {
@@ -608,6 +604,27 @@ function getChatUpdatedAt(history: Awaited<ReturnType<SimpleAgent['history']>>) 
 
 function createAgentConversationStore(sessionId: string) {
   return new JsonConversationStore(path.join(agentSessionsPath, `${sessionId}.json`));
+}
+
+function createAgentMemoryStore(sessionId: string) {
+  return new JsonAgentMemoryStore(
+    path.join(workingMemoryPath, `${sessionId}.json`),
+    path.join(longTermMemoryPath, `${defaultProfileId}.json`)
+  );
+}
+
+function createPendingMemoryStore(sessionId: string) {
+  return new JsonPendingMemoryStore(path.join(pendingMemoryPath, `${sessionId}.json`));
+}
+
+function readMemoryConfidenceThreshold() {
+  const value = readOptionalNumberEnv('MEMORY_CONFIDENCE_THRESHOLD') ?? 0.75;
+  return Math.min(1, value);
+}
+
+function readProfileAutoSaveThreshold() {
+  const value = readOptionalNumberEnv('MEMORY_PROFILE_AUTO_SAVE_THRESHOLD') ?? 0.7;
+  return Math.min(1, value);
 }
 
 function createTokenPricing(agentModel: ModelConfig) {
@@ -722,111 +739,6 @@ function toPublicAgentMessages(history: Awaited<ReturnType<SimpleAgent['history'
   });
 }
 
-function buildContextStrategyComparison(params: { pricing: ReturnType<typeof createTokenPricing>; budget: ReturnType<typeof createTokenBudget> }) {
-  const keepLastMessages = readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5;
-  const scenario = [
-    'Цель: собрать ТЗ для веб-ассистента, который помогает менеджеру оформлять требования.',
-    'Важно: пользователь не технический, интерфейс должен быть простым и на русском.',
-    'Ограничение: без summary-сжатия, сравниваем только sliding window, facts и branching.',
-    'Решение: MVP должен хранить историю локально в JSON и показывать токены.',
-    'Предпочтение: ответы агента должны быть короткими, но не терять договорённости.',
-    'Добавляем требование: нужно поддержать несколько чатов и сброс истории.',
-    'Нужно предусмотреть ошибку переполнения контекста и понятное сообщение пользователю.',
-    'Договорились: facts хранят цель, ограничения, предпочтения, решения и фокус оценки.',
-    'Теперь нужна развилка: одна ветка проектирует UI, другая ветка проектирует API.',
-    'Ветка UI: хотим переключатель стратегий и видимый отчёт по токенам.',
-    'Ветка API: хотим endpoint для создания двух веток от checkpoint.',
-    'Финальный запрос: собери итоговое ТЗ с учётом всех важных деталей.'
-  ];
-  const assistantTurn =
-    'Принял. Фиксирую требование, уточняю риски и предлагаю следующий шаг реализации без добавления summary.';
-
-  return (['sliding-window', 'sticky-facts', 'branching'] as const).map((strategy) => {
-    const history: StoredAgentMessage[] = [];
-    let facts: ConversationFacts = {};
-    let promptTokensTotal = 0;
-    let retainedImportantDetails = 0;
-    const importantDetails = ['Цель', 'Важно', 'Ограничение', 'Решение', 'Предпочтение', 'Договорились'];
-
-    for (const [index, userMessage] of scenario.entries()) {
-      if (strategy === 'sticky-facts') {
-        facts = updateConversationFacts(facts, userMessage);
-      }
-
-      const recentHistory = history.slice(-keepLastMessages);
-      const factMessages = strategy === 'sticky-facts' ? createFactMessages(facts) : [];
-      const selectedHistory = [...factMessages, ...recentHistory.map((message) => ({ role: message.role, content: message.content }) as AgentMessage)];
-      const report = createTokenReport({
-        systemPrompt: agentDefinition.systemPrompt,
-        selectedHistory,
-        fullHistory: history,
-        currentRequest: userMessage,
-        outputText: assistantTurn,
-        pricing: params.pricing,
-        budget: params.budget
-      });
-
-      promptTokensTotal += report.inputTokens;
-      history.push(
-        createDemoStoredMessage('user', userMessage, index),
-        createDemoStoredMessage('assistant', assistantTurn, index)
-      );
-    }
-
-    const finalContextText =
-      strategy === 'sticky-facts'
-        ? `${Object.values(facts).join('\n')}\n${history.slice(-keepLastMessages).map((message) => message.content).join('\n')}`
-        : history
-            .slice(-keepLastMessages)
-            .map((message) => message.content)
-            .join('\n');
-
-    retainedImportantDetails = importantDetails.filter((detail) => finalContextText.includes(detail)).length;
-
-    return {
-      strategy,
-      scenarioTurns: scenario.length,
-      keepLastMessages,
-      promptTokensTotal,
-      averageInputTokens: Math.round(promptTokensTotal / scenario.length),
-      retainedImportantDetails,
-      quality:
-        strategy === 'sticky-facts'
-          ? 'Высокое качество итогового ответа: ранние требования доступны как key-value facts.'
-          : strategy === 'branching'
-            ? 'Высокое качество внутри выбранной ветки, но общие ранние детали зависят от checkpoint.'
-            : 'Хорошо отвечает на свежие сообщения, но ранние требования выпадают из prompt.',
-      stability:
-        strategy === 'sticky-facts'
-          ? 'Стабильная: цель, ограничения, предпочтения и решения переживают длинный диалог.'
-          : strategy === 'branching'
-            ? 'Стабильная для альтернативных направлений: UI/API не смешиваются после развилки.'
-            : 'Низкая на длинном ТЗ: важные ранние детали теряются после N сообщений.',
-      tokenSpend:
-        strategy === 'sticky-facts'
-          ? 'Средний расход: facts добавляют небольшой постоянный блок, зато не нужен полный replay.'
-          : strategy === 'branching'
-            ? 'Средний расход: каждая ветка короче общего диалога, но детали вне checkpoint не видны.'
-            : 'Минимальный расход: в prompt только последние сообщения.',
-      userConvenience:
-        strategy === 'sticky-facts'
-          ? 'Удобно для сбора ТЗ: пользователь может говорить естественно, агент держит договорённости.'
-          : strategy === 'branching'
-            ? 'Удобно для исследования альтернатив: можно переключаться между независимыми версиями.'
-            : 'Просто и предсказуемо, но пользователю приходится повторять ранние требования.'
-    };
-  });
-}
-
-function createDemoStoredMessage(role: StoredAgentMessage['role'], content: string, index: number): StoredAgentMessage {
-  return {
-    id: `demo-${role}-${index}`,
-    role,
-    content,
-    createdAt: new Date(0).toISOString()
-  };
-}
-
 function createHistoryResponse(agent: SimpleAgent, agentModel: ModelConfig, sessionId: string) {
   return agent.history().then((history) => ({
     session: {
@@ -889,8 +801,7 @@ async function listAgentChats(agentModel: ModelConfig): Promise<PublicAgentChat[
 function createAgent(
   agentModel: ModelConfig,
   sessionId: string,
-  contextStrategy: ContextStrategy = 'sliding-window',
-  branch?: { checkpointMessageCount?: number; branchId?: string }
+  memoryUsage?: { working: boolean; longTerm: boolean }
 ) {
   return new SimpleAgent({
     name: 'Simple LLM Agent',
@@ -900,39 +811,27 @@ function createAgent(
     modelTitle: agentModel.title,
     model: agentModel.model,
     conversationStore: createAgentConversationStore(sessionId),
+    memoryStore: createAgentMemoryStore(sessionId),
     tokenPricing: createTokenPricing(agentModel),
     tokenBudget: createTokenBudget(agentModel),
     maxContextMessages: readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? undefined,
     maxContextCharacters: readOptionalNumberEnv('AGENT_MAX_CONTEXT_CHARACTERS') ?? undefined,
-    contextStrategy,
     keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
-    branch: branch?.branchId
-      ? {
-          branchId: branch.branchId,
-          checkpointMessageCount: branch.checkpointMessageCount
-        }
-      : undefined,
+    useWorkingMemory: memoryUsage?.working ?? true,
+    useLongTermMemory: memoryUsage?.longTerm ?? true,
     complete: (messages, options) => requestCompletion(agentModel, messages, options)
   });
 }
 
 app.get('/api/config', (_req: Request, res: Response) => {
-  try {
-    const agentModel = readAgentModelConfig();
-
+  const models = readAvailableModelConfigs();
+  if (models.length > 0) {
     return res.json({
-      defaults: { task: defaultTask },
-      models: [toPublicModelConfig(agentModel)],
-      hasApiKey: Boolean(agentModel.apiKey)
-    });
-  } catch (error) {
-    return res.json({
-      defaults: { task: defaultTask },
-      models: [],
-      hasApiKey: false,
-      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+      models: models.map(toPublicModelConfig),
+      hasApiKey: true
     });
   }
+  return res.json({ models: [], hasApiKey: false, error: 'Не настроен API-ключ ни для одной модели.' });
 });
 
 app.get('/api/agent/history', async (req: Request, res: Response) => {
@@ -954,6 +853,130 @@ app.get('/api/agent/history', async (req: Request, res: Response) => {
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to load agent history.'
     });
+  }
+});
+
+app.get('/api/agent/memory', async (req: Request, res: Response) => {
+  const sessionId = readSessionIdFromRequest(req);
+
+  try {
+    const [snapshot, shortTerm] = await Promise.all([
+      createAgentMemoryStore(sessionId).load(),
+      createAgentConversationStore(sessionId).load()
+    ]);
+    return res.json({
+      sessionId,
+      layers: {
+        shortTerm: {
+          scope: 'current-dialogue',
+          storage: `agent-sessions/${sessionId}.json`,
+          messages: shortTerm
+        },
+        working: {
+          scope: 'current-task',
+          storage: `memory/working/${sessionId}.json`,
+          entries: snapshot.working
+        },
+        longTerm: {
+          scope: 'all-dialogues',
+          profileId: defaultProfileId,
+          storage: `memory/long-term/${defaultProfileId}.json`,
+          entries: snapshot.longTerm
+        }
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load memory.' });
+  }
+});
+
+app.post('/api/agent/memory', async (req: Request, res: Response) => {
+  const write = validateMemoryWrite(req.body);
+  if (typeof write === 'string') return res.status(400).json({ error: write });
+  const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
+
+  try {
+    const entry = await createAgentMemoryStore(sessionId).upsert({ ...write, source: 'manual' });
+    return res.status(201).json({ entry, explicit: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save memory.' });
+  }
+});
+
+app.delete('/api/agent/memory/:layer/:id', async (req: Request, res: Response) => {
+  const layer = (Array.isArray(req.params.layer) ? req.params.layer[0] : req.params.layer) as MemoryLayer;
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  if (layer !== 'working' && layer !== 'long-term') return res.status(400).json({ error: 'Invalid memory layer.' });
+  const sessionId = readSessionIdFromRequest(req);
+
+  try {
+    await createAgentMemoryStore(sessionId).remove(layer, id);
+    return res.status(204).send();
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete memory.' });
+  }
+});
+
+app.get('/api/agent/memory/pending', async (req: Request, res: Response) => {
+  const sessionId = readSessionIdFromRequest(req);
+  try {
+    return res.json({ sessionId, suggestions: await createPendingMemoryStore(sessionId).list() });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load pending memory.' });
+  }
+});
+
+app.post('/api/agent/memory/pending/:id/approve', async (req: Request, res: Response) => {
+  const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const logger = new AgentTurnLogger(agentLogsPath, sessionId);
+  try {
+    const event = await logger.step('memory_persist', () =>
+      approveMemorySuggestion(id, createAgentMemoryStore(sessionId), createPendingMemoryStore(sessionId))
+    );
+    if (!event) return res.status(404).json({ error: 'Pending memory suggestion not found.' });
+    await logger.annotate('memory_persist', { memoryEvents: [event] });
+    return res.json({ event, turnId: logger.turnId });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to approve memory.' });
+  }
+});
+
+app.post('/api/agent/memory/pending/:id/reject', async (req: Request, res: Response) => {
+  const sessionId = normalizeSessionId(typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined);
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const logger = new AgentTurnLogger(agentLogsPath, sessionId);
+  try {
+    const event = await logger.step('memory_persist', () => rejectMemorySuggestion(id, createPendingMemoryStore(sessionId)));
+    if (!event) return res.status(404).json({ error: 'Pending memory suggestion not found.' });
+    await logger.annotate('memory_persist', { memoryEvents: [event] });
+    return res.json({ event, turnId: logger.turnId });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to reject memory.' });
+  }
+});
+
+app.get('/api/agent/logs', async (req: Request, res: Response) => {
+  const sessionId = readSessionIdFromRequest(req);
+  try {
+    return res.json({ sessionId, logs: await listAgentLogs(agentLogsPath, sessionId) });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load agent logs.' });
+  }
+});
+
+app.get('/api/agent/logs/:turnId', async (req: Request, res: Response) => {
+  const sessionId = readSessionIdFromRequest(req);
+  const turnId = Array.isArray(req.params.turnId) ? req.params.turnId[0] : req.params.turnId;
+  if (!/^turn-[a-zA-Z0-9-]+$/.test(turnId)) return res.status(400).json({ error: 'Invalid turnId.' });
+  try {
+    const log = await readAgentLog(agentLogsPath, sessionId, turnId);
+    return log ? res.json(log) : res.status(404).json({ error: 'Agent log not found.' });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load agent log.' });
   }
 });
 
@@ -983,6 +1006,7 @@ app.delete('/api/agent/chats/:sessionId', async (req: Request, res: Response) =>
 
   try {
     await rm(path.join(agentSessionsPath, `${sessionId}.json`), { force: true });
+    await rm(path.join(workingMemoryPath, `${sessionId}.json`), { force: true });
     return res.status(204).send();
   } catch (error) {
     console.error(error);
@@ -1024,88 +1048,6 @@ app.get('/api/agent/token-demo', (_req: Request, res: Response) => {
   }
 });
 
-app.get('/api/agent/context-strategies/demo', (_req: Request, res: Response) => {
-  try {
-    const tokenDemoConfig = readAgentTokenDemoConfig();
-
-    return res.json({
-      title: 'Сбор ТЗ: 12 сообщений, один финальный запрос',
-      comparedBy: ['quality', 'stability', 'tokenSpend', 'userConvenience'],
-      results: buildContextStrategyComparison({
-        pricing: {
-          inputPricePerMillion: tokenDemoConfig.inputPricePerMillion,
-          outputPricePerMillion: tokenDemoConfig.outputPricePerMillion,
-          priceCurrency: tokenDemoConfig.priceCurrency
-        },
-        budget: {
-          maxContextTokens: tokenDemoConfig.maxContextTokens,
-          reservedOutputTokens: tokenDemoConfig.reservedOutputTokens
-        }
-      })
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Context strategy demo configuration is incomplete.'
-    });
-  }
-});
-
-app.post('/api/agent/branches', async (req: Request, res: Response) => {
-  const request = readBranchRequest(req.body);
-
-  if (typeof request === 'string') {
-    return res.status(400).json({ error: request });
-  }
-
-  let agentModel: ModelConfig;
-  try {
-    agentModel = readAgentModelConfig();
-  } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
-    });
-  }
-
-  const sourceSessionId = normalizeSessionId(request.sessionId);
-  const sourceAgent = createAgent(agentModel, sourceSessionId);
-
-  try {
-    const sourceHistory = await sourceAgent.history();
-    const checkpointMessageCount = Math.min(request.checkpointMessageCount ?? sourceHistory.length, sourceHistory.length);
-    const checkpointHistory = sourceHistory.slice(0, checkpointMessageCount);
-    const stamp = Date.now().toString(36);
-    const branchBase = sourceSessionId.slice(0, 24);
-    const branches = [
-      { label: 'UI ветка', sessionId: normalizeSessionId(`${branchBase}-ui-${stamp}`) },
-      { label: 'API ветка', sessionId: normalizeSessionId(`${branchBase}-api-${stamp}`) }
-    ];
-
-    await Promise.all(
-      branches.map(async (branch) => {
-        const branchStore = createAgentConversationStore(branch.sessionId);
-        await branchStore.clear();
-        await branchStore.appendMany(
-          checkpointHistory.map((message) => ({
-            role: message.role,
-            content: message.content
-          }))
-        );
-      })
-    );
-
-    return res.json({
-      sourceSessionId,
-      checkpointMessageCount,
-      branches
-    });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to create branches.'
-    });
-  }
-});
-
 app.delete('/api/agent/history', async (req: Request, res: Response) => {
   let agentModel: ModelConfig;
   try {
@@ -1119,7 +1061,11 @@ app.delete('/api/agent/history', async (req: Request, res: Response) => {
   try {
     const sessionId = readSessionIdFromRequest(req);
     const agent = createAgent(agentModel, sessionId);
-    await agent.clearHistory();
+    await Promise.all([
+      agent.clearHistory(),
+      createAgentMemoryStore(sessionId).clearWorking(),
+      createPendingMemoryStore(sessionId).clear()
+    ]);
     return res.status(204).send();
   } catch (error) {
     console.error(error);
@@ -1210,23 +1156,71 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     return res.status(400).json({ error: request });
   }
 
-  let agentModel: ModelConfig;
-  try {
-    agentModel = readAgentModelConfig();
-  } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Model configuration is incomplete.'
+  const availableModels = readAvailableModelConfigs();
+  const defaultModelId = agentDefinition.modelEnvPrefix.toLowerCase().replace('model_', '');
+  const agentModel = request.modelId
+    ? availableModels.find((model) => model.id === request.modelId)
+    : availableModels.find((model) => model.id === defaultModelId) ?? availableModels[0];
+  if (!agentModel) {
+    return res.status(request.modelId ? 400 : 500).json({
+      error: request.modelId ? `Модель ${request.modelId} недоступна или не настроена.` : 'Не настроена ни одна модель.'
     });
   }
 
   const sessionId = normalizeSessionId(request.sessionId);
-  const agent = createAgent(agentModel, sessionId, request.contextStrategy);
+  const agent = createAgent(agentModel, sessionId, {
+    working: request.useWorkingMemory,
+    longTerm: request.useLongTermMemory
+  });
+  const logger = new AgentTurnLogger(agentLogsPath, sessionId);
 
   try {
-    const result = await agent.run(request.message);
+    const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId).load());
+    await logger.step('context_assembly', async () => { await agent.inspectNextRun(request.message); });
+    const result = await logger.step('provider_request', () => agent.run(request.message), {
+      provider: agentDefinition.provider,
+      model: agentModel.model
+    });
+    await logger.annotate('provider_request', {
+      inputTokens: result.inputTokens ?? undefined,
+      outputTokens: result.outputTokens ?? undefined
+    });
+    await logger.step('conversation_persist', async () => undefined);
     const history = await agent.history();
+    let reflection: Awaited<ReturnType<typeof reflectConversationMemory>> | null = null;
+    try {
+      reflection = await logger.step('memory_classification', () => reflectConversationMemory({
+        history,
+        previousMemory: loadedMemory,
+        userMessage: request.message,
+        assistantAnswer: result.answer,
+        complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
+      }), { provider: agentDefinition.provider, model: agentModel.model });
+    } catch {
+      reflection = null;
+    }
+    const policyEvents = await logger.step('memory_policy', () => applyMemoryPolicy(reflection?.longTermCandidates ?? [], {
+      sessionId,
+      profileId: defaultProfileId,
+      confidenceThreshold: readMemoryConfidenceThreshold(),
+      longTermAutoSaveThreshold: readProfileAutoSaveThreshold(),
+      memoryStore: createAgentMemoryStore(sessionId),
+      pendingStore: createPendingMemoryStore(sessionId)
+    }));
+    await logger.annotate('memory_policy', { memoryEvents: policyEvents });
+    const workingWrites = reflection ? workingSummaryToWrites(reflection.working) : [];
+    const workingEvent: MemoryEvent | null = reflection ? {
+      type: 'updated', scope: 'working', reason: 'Сжатый контекст текущей задачи обновлён.', createdAt: new Date().toISOString()
+    } : null;
+    await logger.step('memory_persist', async () => {
+      if (reflection) await createAgentMemoryStore(sessionId).replaceAgentWorking(workingWrites);
+    }, { memoryEvents: workingEvent ? [workingEvent, ...policyEvents] : policyEvents });
+    const memoryEvents = workingEvent ? [workingEvent, ...policyEvents] : policyEvents;
     return res.json({
       ...result,
+      turnId: logger.turnId,
+      memoryReflection: reflection,
+      memoryEvents,
       session: {
         sessionId,
         title: createChatTitle(history, sessionId)

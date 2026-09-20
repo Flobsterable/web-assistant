@@ -17,6 +17,8 @@ type AgentResponse = {
   model: string;
   session?: AgentSession;
   stats?: HistoryTokenStats;
+  turnId?: string;
+  memoryEvents?: MemoryEvent[];
 };
 
 type AgentErrorResponse = {
@@ -39,9 +41,6 @@ type PublicModelConfig = {
 };
 
 type AppConfig = {
-  defaults: {
-    task: string;
-  };
   models: PublicModelConfig[];
   hasApiKey: boolean;
   error?: string;
@@ -78,8 +77,6 @@ type AgentChatSummary = AgentSession & {
 type AgentChatsResponse = {
   chats: AgentChatSummary[];
 };
-
-type ContextStrategy = 'sliding-window' | 'sticky-facts' | 'branching';
 
 type RequestTokenMeta = {
   currentRequestTokens: number;
@@ -121,45 +118,26 @@ type AgentTokenReport = {
 };
 
 type ContextManagementReport = {
-  strategy: ContextStrategy;
   keepLastMessages: number;
   fullHistoryMessages: number;
   exactHistoryMessages: number;
   fullHistoryTokens: number;
   selectedHistoryTokens: number;
-  factsTokens: number;
   uncompressedInputTokens: number;
   managedInputTokens: number;
   savedInputTokens: number;
   savedInputPercent: number;
-  facts: Record<string, string>;
-  branch?: {
-    checkpointMessageCount: number;
-    branchId: string;
+  memory: {
+    workingEnabled: boolean;
+    longTermEnabled: boolean;
+    shortTermMessages: number;
+    workingItems: number;
+    longTermItems: number;
+    workingTokens: number;
+    longTermTokens: number;
+    appliedWorkingIds: string[];
+    appliedLongTermIds: string[];
   };
-};
-
-type ContextDemoResult = {
-  strategy: ContextStrategy;
-  scenarioTurns: number;
-  keepLastMessages: number;
-  promptTokensTotal: number;
-  averageInputTokens: number;
-  retainedImportantDetails: number;
-  quality: string;
-  stability: string;
-  tokenSpend: string;
-  userConvenience: string;
-};
-
-type ContextDemoResponse = {
-  title: string;
-  results: ContextDemoResult[];
-};
-
-type BranchLink = {
-  label: string;
-  sessionId: string;
 };
 
 type HistoryTokenStats = {
@@ -181,6 +159,55 @@ type HistoryTokenStats = {
   priceCurrency: string;
 };
 
+type MemoryLayer = 'working' | 'long-term';
+type MemoryCategory = 'goal' | 'constraint' | 'artifact' | 'note' | 'profile' | 'decision' | 'knowledge';
+
+type MemoryEntry = {
+  id: string;
+  layer: MemoryLayer;
+  category: MemoryCategory;
+  key: string;
+  value: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MemoryResponse = {
+  sessionId: string;
+  layers: {
+    shortTerm: { scope: string; storage: string; messages: ChatMessage[] };
+    working: { scope: string; storage: string; entries: MemoryEntry[] };
+    longTerm: { scope: string; storage: string; entries: MemoryEntry[] };
+  };
+};
+
+type MemoryCandidate = {
+  scope: 'none' | MemoryLayer;
+  operation: 'create' | 'update' | 'delete' | 'skip';
+  category?: MemoryCategory;
+  key: string;
+  value?: string;
+  targetId?: string;
+  confidence: number;
+  importance?: number;
+  reason: string;
+};
+
+type MemoryEvent = {
+  type: string;
+  scope: 'none' | MemoryLayer;
+  candidate?: MemoryCandidate;
+  reason: string;
+};
+
+type PendingMemorySuggestion = {
+  id: string;
+  candidate: MemoryCandidate & { scope: 'long-term' };
+  createdAt: string;
+};
+
+type PendingMemoryResponse = { sessionId: string; suggestions: PendingMemorySuggestion[] };
+
 function formatDuration(ms: number) {
   if (ms < 1000) return `${ms} мс`;
   return `${(ms / 1000).toFixed(2)} с`;
@@ -197,10 +224,39 @@ function formatTokens(value: number | null | undefined) {
   return new Intl.NumberFormat('ru-RU').format(value);
 }
 
-function strategyTitle(strategy: ContextStrategy) {
-  if (strategy === 'sticky-facts') return 'Sticky Facts';
-  if (strategy === 'branching') return 'Branching';
-  return 'Sliding Window';
+function memoryCategoryTitle(category: MemoryCategory | undefined) {
+  const titles: Record<MemoryCategory, string> = {
+    goal: 'Цель', constraint: 'Ограничение', artifact: 'Материал', note: 'Заметка',
+    profile: 'О пользователе', decision: 'Решение', knowledge: 'Знание'
+  };
+  return category ? titles[category] : 'Память';
+}
+
+function memoryKeyTitle(key: string) {
+  const titles: Record<string, string> = {
+    'task.goal': 'Цель задачи',
+    'task.state': 'Текущее состояние',
+    'task.constraints': 'Ограничения',
+    'task.decisions': 'Принятые решения',
+    'task.artifacts': 'Материалы и файлы',
+    'task.next_steps': 'Следующие шаги',
+    'profile.language': 'Язык общения',
+    'profile.communication_style': 'Стиль общения',
+    'profile.role': 'Роль и сфера деятельности',
+    'profile.preferences': 'Предпочтения',
+    'profile.constraints': 'Постоянные ограничения',
+    'profile.summary': 'Краткий профиль'
+  };
+  return titles[key] ?? key;
+}
+
+function memoryEventTitle(type: string, scope: MemoryEvent['scope']) {
+  if (type === 'created') return scope === 'long-term' ? 'Запомнил о вас' : 'Запомнил для этой задачи';
+  if (type === 'updated') return scope === 'long-term' ? 'Обновил сведения о вас' : 'Обновил память задачи';
+  if (type === 'deleted') return 'Удалил из памяти задачи';
+  if (type === 'suggestion_created') return 'Предложил сохранить надолго';
+  if (type === 'clarification_required') return 'Нужно уточнить перед сохранением';
+  return 'Память не изменена';
 }
 
 function toRequestTokenMeta(tokenReport: AgentTokenReport): RequestTokenMeta {
@@ -231,8 +287,13 @@ function readInitialSessionId() {
   return window.localStorage.getItem('agent-session-id') ?? createSessionId();
 }
 
+function readMemoryToggle(key: string) {
+  return window.localStorage.getItem(key) !== 'false';
+}
+
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isAgent = message.role === 'agent';
+  const visibleMemoryEvents = message.meta?.memoryEvents?.filter((event) => event.type !== 'skipped' && event.type !== 'invalid_candidate') ?? [];
 
   return (
     <article className={`message ${message.role}`}>
@@ -241,25 +302,35 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       {message.meta && (
         <footer className="message-meta">
           <span>{message.meta.modelTitle}</span>
-          <span>{message.meta.model}</span>
           <span>{formatDuration(message.meta.elapsedMs)}</span>
-          <span>запрос: {formatTokens(message.meta.tokenReport?.currentRequestTokens)}</span>
-          <span>история: {formatTokens(message.meta.tokenReport?.fullHistoryTokens)}</span>
-          <span>ответ: {formatTokens(message.meta.tokenReport?.outputTokens ?? message.meta.outputTokens)}</span>
-          <span>total: {formatTokens(message.meta.totalTokens)}</span>
-          <span>стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
         </footer>
       )}
-      {message.meta?.contextManagement && (
-        <footer className="message-meta compression-meta">
-          <span>стратегия: {strategyTitle(message.meta.contextManagement.strategy)}</span>
-          <span>последних: {formatTokens(message.meta.contextManagement.exactHistoryMessages)}</span>
-          <span>facts: {formatTokens(Object.keys(message.meta.contextManagement.facts).length)}</span>
-          <span>facts токены: {formatTokens(message.meta.contextManagement.factsTokens)}</span>
-          <span>input без управления: {formatTokens(message.meta.contextManagement.uncompressedInputTokens)}</span>
-          <span>managed input: {formatTokens(message.meta.contextManagement.managedInputTokens)}</span>
-          <span>экономия: {formatTokens(message.meta.contextManagement.savedInputTokens)} ({message.meta.contextManagement.savedInputPercent}%)</span>
+      {visibleMemoryEvents.length > 0 ? (
+        <footer className="message-meta memory-decisions">
+          {visibleMemoryEvents.map((event, index) => (
+            <span key={`${event.type}-${index}`} title={event.reason}>
+              {memoryEventTitle(event.type, event.scope)}{event.candidate?.key ? `: ${event.candidate.key}` : ''}
+            </span>
+          ))}
         </footer>
+      ) : null}
+      {message.meta?.contextManagement && (
+        <details className="message-details">
+          <summary>Технические детали</summary>
+          <div className="message-details-grid">
+            <span>Модель: {message.meta.model}</span>
+            <span>Запрос: {formatTokens(message.meta.tokenReport?.currentRequestTokens)} токенов</span>
+            <span>История: {formatTokens(message.meta.tokenReport?.fullHistoryTokens)} токенов</span>
+            <span>Ответ: {formatTokens(message.meta.tokenReport?.outputTokens ?? message.meta.outputTokens)} токенов</span>
+            <span>Контекст: {formatTokens(message.meta.contextManagement.managedInputTokens)} токенов</span>
+            <span>Экономия: {message.meta.contextManagement.savedInputPercent}%</span>
+            <span>Память задачи: {message.meta.contextManagement.memory.appliedWorkingIds.length}</span>
+            <span>Долгая память: {message.meta.contextManagement.memory.appliedLongTermIds.length}</span>
+            <span>Рабочая: {message.meta.contextManagement.memory.workingEnabled ? 'включена' : 'выключена'}</span>
+            <span>Долговременная: {message.meta.contextManagement.memory.longTermEnabled ? 'включена' : 'выключена'}</span>
+            <span>Стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
+          </div>
+        </details>
       )}
       {message.responseMeta && !message.meta && (
         <footer className="message-meta">
@@ -270,15 +341,15 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </footer>
       )}
       {message.tokenMeta && (
-        <footer className="message-meta">
-          <span>запрос: {formatTokens(message.tokenMeta.currentRequestTokens)}</span>
-          <span>вся история: {formatTokens(message.tokenMeta.fullHistoryTokens)}</span>
-          <span>история в prompt: {formatTokens(message.tokenMeta.selectedHistoryTokens)}</span>
-          <span>input: {formatTokens(message.tokenMeta.inputTokens)}</span>
-          <span>лимит: {formatTokens(message.tokenMeta.maxContextTokens)}</span>
-          <span>осталось: {formatTokens(message.tokenMeta.remainingInputTokens)}</span>
-          <span>стоимость input: {formatCost(message.tokenMeta.estimatedInputCost, message.tokenMeta.priceCurrency)}</span>
-        </footer>
+        <details className="message-details">
+          <summary>Детали запроса</summary>
+          <div className="message-details-grid">
+            <span>Запрос: {formatTokens(message.tokenMeta.currentRequestTokens)}</span>
+            <span>История: {formatTokens(message.tokenMeta.fullHistoryTokens)}</span>
+            <span>В контексте: {formatTokens(message.tokenMeta.selectedHistoryTokens)}</span>
+            <span>Осталось: {formatTokens(message.tokenMeta.remainingInputTokens)}</span>
+          </div>
+        </details>
       )}
     </article>
   );
@@ -293,14 +364,24 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [historyStats, setHistoryStats] = useState<HistoryTokenStats>();
-  const [contextStrategy, setContextStrategy] = useState<ContextStrategy>('sliding-window');
-  const [contextDemo, setContextDemo] = useState<ContextDemoResponse>();
-  const [branchLinks, setBranchLinks] = useState<BranchLink[]>([]);
-  const [branchCheckpoint, setBranchCheckpoint] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [memory, setMemory] = useState<MemoryResponse>();
+  const [pendingMemory, setPendingMemory] = useState<PendingMemorySuggestion[]>([]);
+  const [memoryLayer, setMemoryLayer] = useState<MemoryLayer>('working');
+  const [memoryCategory, setMemoryCategory] = useState<MemoryCategory>('goal');
+  const [memoryKey, setMemoryKey] = useState('');
+  const [memoryValue, setMemoryValue] = useState('');
+  const [isSavingMemory, setIsSavingMemory] = useState(false);
+  const [isMemoryOpen, setIsMemoryOpen] = useState(false);
+  const [useWorkingMemory, setUseWorkingMemory] = useState(() => readMemoryToggle('use-working-memory'));
+  const [useLongTermMemory, setUseLongTermMemory] = useState(() => readMemoryToggle('use-long-term-memory'));
+  const [selectedModelId, setSelectedModelId] = useState(() => window.localStorage.getItem('agent-model-id') ?? 'flash');
 
-  const flashModel = useMemo(() => config?.models.find((model) => model.id === 'flash'), [config]);
+  const selectedModel = useMemo(
+    () => config?.models.find((model) => model.id === selectedModelId) ?? config?.models[0],
+    [config, selectedModelId]
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -308,11 +389,12 @@ export default function App() {
     async function loadInitialData() {
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
-        const [configResponse, chatsResponse, historyResponse, demoResponse] = await Promise.all([
+        const [configResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
           fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
-          fetch('/api/agent/context-strategies/demo', { signal: controller.signal })
+          fetch(`/api/agent/memory?${sessionQuery}`, { signal: controller.signal }),
+          fetch(`/api/agent/memory/pending?${sessionQuery}`, { signal: controller.signal })
         ]);
         const data = (await configResponse.json()) as AppConfig;
 
@@ -321,7 +403,14 @@ export default function App() {
         }
 
         setConfig(data);
-        setMessage(data.defaults.task);
+        const savedModelId = window.localStorage.getItem('agent-model-id');
+        const nextModel = data.models.find((model) => model.id === savedModelId)
+          ?? data.models.find((model) => model.id === 'flash')
+          ?? data.models[0];
+        if (nextModel) {
+          setSelectedModelId(nextModel.id);
+          window.localStorage.setItem('agent-model-id', nextModel.id);
+        }
 
         if (chatsResponse.ok) {
           const chatsData = (await chatsResponse.json()) as AgentChatsResponse;
@@ -346,8 +435,11 @@ export default function App() {
           setHistoryStats(history.stats);
         }
 
-        if (demoResponse.ok) {
-          setContextDemo((await demoResponse.json()) as ContextDemoResponse);
+        if (memoryResponse.ok) {
+          setMemory((await memoryResponse.json()) as MemoryResponse);
+        }
+        if (pendingResponse.ok) {
+          setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
         }
 
       } catch (caughtError) {
@@ -373,12 +465,12 @@ export default function App() {
     setSession(undefined);
     setMessages([]);
     setHistoryStats(undefined);
+    setMemory(undefined);
+    setPendingMemory([]);
     setError('');
   }
 
   function handleNewChat() {
-    setBranchLinks([]);
-    setBranchCheckpoint(null);
     openChat(createSessionId());
   }
 
@@ -406,11 +498,9 @@ export default function App() {
   }
 
   async function handleReset() {
-    setMessage(config?.defaults.task ?? '');
+    setMessage('');
     setMessages([]);
     setHistoryStats(undefined);
-    setBranchLinks([]);
-    setBranchCheckpoint(null);
     setError('');
 
     try {
@@ -423,46 +513,80 @@ export default function App() {
       }
 
       void refreshChats();
+      void refreshMemory();
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Не удалось очистить историю агента.');
     }
   }
 
-  async function handleContextStrategyChange(nextStrategy: ContextStrategy) {
-    setContextStrategy(nextStrategy);
-
-    if (nextStrategy !== 'branching') return;
-    if (messages.length === 0 || branchLinks.length > 0) return;
-
-    await handleCreateBranches();
+  function handleMemoryLayerChange(layer: MemoryLayer) {
+    setMemoryLayer(layer);
+    setMemoryCategory(layer === 'working' ? 'goal' : 'profile');
   }
 
-  async function handleCreateBranches() {
+  async function refreshMemory() {
+    const query = new URLSearchParams({ sessionId }).toString();
+    const [response, pendingResponse] = await Promise.all([
+      fetch(`/api/agent/memory?${query}`),
+      fetch(`/api/agent/memory/pending?${query}`)
+    ]);
+    if (!response.ok || !pendingResponse.ok) throw new Error('Не удалось загрузить память.');
+    setMemory((await response.json()) as MemoryResponse);
+    setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
+  }
+
+  async function handlePendingMemory(id: string, action: 'approve' | 'reject') {
     setError('');
+    try {
+      const response = await fetch(`/api/agent/memory/pending/${encodeURIComponent(id)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId })
+      });
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(data.error ?? 'Не удалось обработать предложение памяти.');
+      await refreshMemory();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось обработать предложение памяти.');
+    }
+  }
+
+  async function handleSaveMemory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError('');
+    setIsSavingMemory(true);
 
     try {
-      const response = await fetch('/api/agent/branches', {
+      const response = await fetch('/api/agent/memory', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId,
-          checkpointMessageCount: messages.length
+          layer: memoryLayer,
+          category: memoryCategory,
+          key: memoryKey,
+          value: memoryValue
         })
       });
-      const data = (await response.json()) as { branches?: BranchLink[]; checkpointMessageCount?: number; error?: string };
-
-      if (!response.ok || !data.branches?.length) {
-        throw new Error(data.error ?? 'Не удалось создать ветки.');
-      }
-
-      setBranchLinks(data.branches);
-      setBranchCheckpoint(data.checkpointMessageCount ?? messages.length);
-      await refreshChats();
-      openChat(data.branches[0].sessionId);
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(data.error ?? 'Не удалось сохранить память.');
+      setMemoryKey('');
+      setMemoryValue('');
+      await refreshMemory();
     } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось создать ветки.');
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось сохранить память.');
+    } finally {
+      setIsSavingMemory(false);
+    }
+  }
+
+  async function handleDeleteMemory(layer: MemoryLayer, id: string) {
+    setError('');
+    const query = new URLSearchParams({ sessionId }).toString();
+    try {
+      const response = await fetch(`/api/agent/memory/${layer}/${encodeURIComponent(id)}?${query}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error('Не удалось удалить запись памяти.');
+      await refreshMemory();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось удалить запись памяти.');
     }
   }
 
@@ -497,7 +621,9 @@ export default function App() {
         body: JSON.stringify({
           message: trimmedMessage,
           sessionId,
-          contextStrategy
+          modelId: selectedModel?.id,
+          useWorkingMemory,
+          useLongTermMemory
         })
       });
 
@@ -523,6 +649,7 @@ export default function App() {
       if (agentResponse.session) setSession(agentResponse.session);
       if (agentResponse.stats) setHistoryStats(agentResponse.stats);
       void refreshChats();
+      void refreshMemory();
       setMessages((currentMessages) => [
         ...currentMessages.map((currentMessage) =>
           currentMessage.id === userMessage.id && agentResponse.tokenReport
@@ -597,8 +724,8 @@ export default function App() {
               <code>{sessionId}</code>
             </div>
             <div className="chat-header-actions">
-              <span className={`api-status ${flashModel ? 'ready' : 'pending'}`}>
-                <span className="status-dot" /> {flashModel ? flashModel.model : 'Подключение'}
+              <span className={`api-status ${selectedModel ? 'ready' : 'pending'}`}>
+                <span className="status-dot" /> {selectedModel ? selectedModel.model : 'Подключение'}
               </span>
               <button type="button" onClick={handleNewChat}>
                 Новый чат
@@ -606,12 +733,12 @@ export default function App() {
             </div>
           </header>
 
-          {(flashModel || historyStats) && (
+          {(selectedModel || historyStats) && (
             <section className={`compact-metrics ${historyStats?.willOverflowOnNextSmallRequest ? 'overflow' : ''}`} aria-label="Лимиты и статистика">
-              {flashModel && (
+              {selectedModel && (
                 <>
-                  <span>Провайдер: <strong>{flashModel.provider}</strong></span>
-                  <span>Контекст: <strong>{formatTokens(flashModel.maxContextTokens)}</strong></span>
+                  <span>Провайдер: <strong>{selectedModel.provider}</strong></span>
+                  <span>Контекст: <strong>{formatTokens(selectedModel.maxContextTokens)}</strong></span>
                 </>
               )}
               {historyStats && (
@@ -632,56 +759,136 @@ export default function App() {
             </section>
           )}
 
-          <section className="context-controls" aria-label="Управление контекстом">
-            <div className="context-control-row">
-              <label htmlFor="context-strategy">Стратегия контекста</label>
-              <select
-                id="context-strategy"
-                value={contextStrategy}
-                onChange={(event) => void handleContextStrategyChange(event.target.value as ContextStrategy)}
-                disabled={isLoading}
+          <section className="memory-panel" aria-label="Память агента">
+            <div className="memory-heading">
+              <div>
+                <span>Память агента</span>
+                <strong>Агент помнит важное</strong>
+                <p>Свежие сообщения остаются в окне, задача сжимается в рабочий контекст, а важные сведения профиля агент запоминает автоматически.</p>
+              </div>
+              <button
+                className="memory-toggle"
+                type="button"
+                aria-expanded={isMemoryOpen}
+                onClick={() => setIsMemoryOpen((isOpen) => !isOpen)}
               >
-                <option value="sliding-window">Sliding Window</option>
-                <option value="sticky-facts">Sticky Facts / Key-Value Memory</option>
-                <option value="branching">Branching</option>
-              </select>
-              {contextStrategy === 'branching' && (
-                <button type="button" onClick={() => void handleCreateBranches()} disabled={isLoading || messages.length === 0}>
-                  Checkpoint + 2 ветки
-                </button>
-              )}
+                {isMemoryOpen ? 'Скрыть настройки' : 'Управление памятью'}
+                <span aria-hidden="true">{isMemoryOpen ? '↑' : '↓'}</span>
+              </button>
             </div>
 
-            {contextStrategy === 'branching' && branchLinks.length > 0 && (
-              <div className="branch-switcher">
-                <span>Checkpoint: {formatTokens(branchCheckpoint)} сообщений</span>
-                <div>
-                  {branchLinks.map((branch) => (
-                    <button
-                      className={branch.sessionId === sessionId ? 'active' : ''}
-                      key={branch.sessionId}
-                      type="button"
-                      onClick={() => openChat(branch.sessionId)}
-                    >
-                      {branch.label}
-                    </button>
-                  ))}
-                </div>
+            <div className="memory-summary" aria-label="Состояние памяти">
+              <div><strong>{memory?.layers.shortTerm.messages.length ?? messages.length}</strong><span>сообщений в чате</span></div>
+              <div><strong>{memory?.layers.working.entries.length ? 'Готов' : '—'}</strong><span>контекст задачи</span></div>
+              <div><strong>{memory?.layers.longTerm.entries.length ?? 0}</strong><span>сохранено надолго</span></div>
+              {pendingMemory.length > 0 && <div className="attention"><strong>{pendingMemory.length}</strong><span>ждёт решения</span></div>}
+            </div>
+
+            <div className="memory-switches" aria-label="Использование памяти в ответах">
+              <label>
+                <span className="memory-switch-copy">
+                  <strong>Рабочая память</strong>
+                  <small>Сжатый контекст текущей задачи</small>
+                </span>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={useWorkingMemory}
+                  onChange={(event) => {
+                    setUseWorkingMemory(event.target.checked);
+                    window.localStorage.setItem('use-working-memory', String(event.target.checked));
+                  }}
+                />
+                <span className="memory-switch-control" aria-hidden="true" />
+              </label>
+              <label>
+                <span className="memory-switch-copy">
+                  <strong>Долговременная память</strong>
+                  <small>Персональные сведения из всех чатов</small>
+                </span>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={useLongTermMemory}
+                  onChange={(event) => {
+                    setUseLongTermMemory(event.target.checked);
+                    window.localStorage.setItem('use-long-term-memory', String(event.target.checked));
+                  }}
+                />
+                <span className="memory-switch-control" aria-hidden="true" />
+              </label>
+            </div>
+
+            {pendingMemory.length > 0 && (
+              <div className="pending-memory">
+                <strong>Что запомнить надолго?</strong>
+                <p className="pending-memory-hint">Решения и знания требуют подтверждения. Важные сведения профиля сохраняются автоматически.</p>
+                {pendingMemory.map((suggestion) => (
+                  <div className="pending-memory-item" key={suggestion.id}>
+                    <div>
+                      <span>{memoryCategoryTitle(suggestion.candidate.category)}</span>
+                      <b>{suggestion.candidate.key}</b>
+                      <p>{suggestion.candidate.value}</p>
+                    </div>
+                    <div className="pending-memory-actions">
+                      <button type="button" onClick={() => void handlePendingMemory(suggestion.id, 'approve')}>Запомнить</button>
+                      <button type="button" onClick={() => void handlePendingMemory(suggestion.id, 'reject')}>Не сохранять</button>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
-            {contextDemo && (
-              <div className="context-demo">
-                <div className="context-demo-title">{contextDemo.title}</div>
-                <div className="context-demo-grid">
-                  {contextDemo.results.map((result) => (
-                    <article className="context-demo-item" key={result.strategy}>
-                      <strong>{strategyTitle(result.strategy)}</strong>
-                      <span>Средний input: {formatTokens(result.averageInputTokens)}</span>
-                      <span>Детали: {result.retainedImportantDetails}/6</span>
-                      <p>{result.stability}</p>
-                    </article>
-                  ))}
+            {isMemoryOpen && (
+              <div className="memory-settings">
+                <div className="memory-settings-heading">
+                  <strong>Добавить вручную</strong>
+                  <span>Для опытных пользователей</span>
+                </div>
+                <form className="memory-form" onSubmit={handleSaveMemory}>
+                  <label>
+                    Где помнить
+                    <select value={memoryLayer} onChange={(event) => handleMemoryLayerChange(event.target.value as MemoryLayer)}>
+                      <option value="working">Только в этой задаче</option>
+                      <option value="long-term">Во всех чатах</option>
+                    </select>
+                  </label>
+                  <label>
+                    Что это
+                    <select value={memoryCategory} onChange={(event) => setMemoryCategory(event.target.value as MemoryCategory)}>
+                      {memoryLayer === 'working' ? (
+                        <><option value="goal">Цель</option><option value="constraint">Ограничение</option><option value="artifact">Материал</option><option value="note">Заметка</option></>
+                      ) : (
+                        <><option value="profile">О пользователе</option><option value="decision">Решение</option><option value="knowledge">Знание</option></>
+                      )}
+                    </select>
+                  </label>
+                  <label>
+                    Короткое название
+                    <input value={memoryKey} onChange={(event) => setMemoryKey(event.target.value)} placeholder="Например: формат ответа" maxLength={80} required />
+                  </label>
+                  <label className="memory-value-field">
+                    Что нужно запомнить
+                    <input value={memoryValue} onChange={(event) => setMemoryValue(event.target.value)} placeholder="Например: отвечать короткими списками" maxLength={2000} required />
+                  </label>
+                  <button type="submit" disabled={isSavingMemory}>{isSavingMemory ? 'Сохраняю…' : 'Добавить'}</button>
+                </form>
+
+                <div className="memory-entry-groups">
+                  {(['working', 'long-term'] as const).map((layer) => {
+                    const entries = layer === 'working' ? memory?.layers.working.entries : memory?.layers.longTerm.entries;
+                    return (
+                      <div className="memory-entry-group" key={layer}>
+                        <strong>{layer === 'working' ? 'Для этой задачи' : 'Для всех чатов'}</strong>
+                        {!entries?.length ? <span className="memory-empty">Пока ничего не сохранено</span> : entries.map((entry) => (
+                          <div className="memory-entry" key={entry.id}>
+                            <div><span>{memoryCategoryTitle(entry.category)}</span><b>{memoryKeyTitle(entry.key)}</b><p>{entry.value}</p></div>
+                            <button type="button" onClick={() => void handleDeleteMemory(layer, entry.id)} aria-label={`Удалить ${entry.key}`}>Удалить</button>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -689,23 +896,39 @@ export default function App() {
 
         <section className="chat-panel" aria-live="polite">
           {messages.length === 0 ? (
-            <div className="empty-state">Ответ агента появится здесь после первого запроса.</div>
+            <div className="empty-state">Начните диалог — напишите сообщение ниже.</div>
           ) : (
             messages.map((chatMessage) => <MessageBubble key={chatMessage.id} message={chatMessage} />)
           )}
           {isLoading && (
             <article className="message agent">
               <div className="message-label">Агент</div>
-              <div className="message-body muted">Думаю и вызываю LLM API...</div>
+              <div className="message-body muted">Готовлю ответ…</div>
             </article>
           )}
         </section>
 
         <form className="request-card" onSubmit={handleSubmit}>
           <div className="request-header">
-            <label htmlFor="message">Запрос пользователя</label>
+            <label htmlFor="message">Сообщение</label>
             <div className="request-tools">
               <span>{message.length} символов</span>
+              <label className="model-picker">
+                <span>Модель</span>
+                <select
+                  value={selectedModel?.id ?? ''}
+                  onChange={(event) => {
+                    setSelectedModelId(event.target.value);
+                    window.localStorage.setItem('agent-model-id', event.target.value);
+                  }}
+                  disabled={!config?.models.length || isLoading}
+                  aria-label="Модель для запроса"
+                >
+                  {config?.models.map((model) => (
+                    <option value={model.id} key={model.id}>{model.title} · {model.model}</option>
+                  ))}
+                </select>
+              </label>
               <button className="reset-button" type="button" onClick={handleReset} disabled={!config || isLoading}>
                 Сбросить
               </button>
@@ -726,8 +949,8 @@ export default function App() {
                 {configError || error}
               </p>
             )}
-            <button className="submit-button" type="submit" disabled={!flashModel || Boolean(configError) || isLoading}>
-              {!config ? 'Загрузка настроек...' : isLoading ? 'Агент отвечает...' : 'Отправить агенту'}
+            <button className="submit-button" type="submit" disabled={!selectedModel || Boolean(configError) || isLoading}>
+              {!config ? 'Загрузка…' : isLoading ? 'Отвечаю…' : 'Отправить'}
               {!isLoading && <span aria-hidden="true">→</span>}
             </button>
           </div>
