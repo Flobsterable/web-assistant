@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { MemoryEntry, MemoryWrite } from './memory.js';
+import type { Invariant } from './invariant.js';
 
 export type TaskPhase = 'planning' | 'execution' | 'validation' | 'done';
 export type TaskStatus = 'active' | 'paused' | 'done';
@@ -31,6 +32,7 @@ export type TaskState = {
   resumedAt: string | null;
   transitions?: TaskTransition[];
   lastValidation?: { passed: boolean; summary: string; at: string } | null;
+  lastTransitionError?: string | null;
 };
 
 export type TaskCommand =
@@ -109,20 +111,82 @@ export function transitionTaskPhase(from: TaskPhase, requested: TaskPhase) {
 export function resolveTaskPhaseTransition(
   from: TaskPhase,
   requested: TaskPhase,
-  validationPassed: boolean
-): { phase: TaskPhase; path: TaskPhase[] } {
-  if (from === 'done' || requested === from) return { phase: from, path: [] as TaskPhase[] };
-  if (requested === 'done') {
-    if (!validationPassed) {
-      const next: TaskPhase = from === 'planning' ? 'execution' : from === 'execution' ? 'validation' : from;
-      return { phase: next, path: next === from ? [] : [next] };
-    }
-    const sequence: TaskPhase[] = ['planning', 'execution', 'validation', 'done'];
-    const path = sequence.slice(sequence.indexOf(from) + 1);
-    return { phase: 'done' as const, path };
+  validationPassed: boolean,
+  planApproved = false
+): { phase: TaskPhase; path: TaskPhase[]; allowed: boolean; rejectionReason: string | null } {
+  if (requested === from) return { phase: from, path: [], allowed: true, rejectionReason: null };
+  if (from === 'done') {
+    return {
+      phase: from,
+      path: [],
+      allowed: false,
+      rejectionReason: 'Завершённая задача не может вернуться на предыдущий этап.'
+    };
   }
-  const phase = transitionTaskPhase(from, requested);
-  return { phase, path: phase === from ? [] : [phase] };
+  if (!canTransitionTaskPhase(from, requested)) {
+    return {
+      phase: from,
+      path: [],
+      allowed: false,
+      rejectionReason: `Переход ${from} → ${requested} запрещён: этапы нужно проходить последовательно.`
+    };
+  }
+  if (from === 'planning' && requested === 'execution' && !planApproved) {
+    return {
+      phase: from,
+      path: [],
+      allowed: false,
+      rejectionReason: 'Нельзя начинать реализацию, пока пользователь явно не утвердил план.'
+    };
+  }
+  if (from === 'validation' && requested === 'done' && !validationPassed) {
+    return {
+      phase: from,
+      path: [],
+      allowed: false,
+      rejectionReason: 'Нельзя завершить задачу без успешной проверки результата.'
+    };
+  }
+  return { phase: requested, path: [requested], allowed: true, rejectionReason: null };
+}
+
+export function taskPhaseFromMemory(entries: MemoryEntry[]): TaskPhase {
+  const value = entries.find((entry) => entry.key === 'task.stage')?.value;
+  return value === 'execution' || value === 'validation' || value === 'done' ? value : 'planning';
+}
+
+export function createTaskLifecycleInvariant(phase: TaskPhase): Invariant {
+  const rules: Record<TaskPhase, { title: string; rule: string; rationale: string }> = {
+    planning: {
+      title: 'Сначала утвердить план',
+      rule: 'Текущий этап — planning. Ассистент может составлять и уточнять план, но не выполнять реализацию. Переход к реализации допустим только при явном и недвусмысленном утверждении плана пользователем в текущем запросе.',
+      rationale: 'Реализация не должна начинаться до согласования плана.'
+    },
+    execution: {
+      title: 'Сначала передать результат на проверку',
+      rule: 'Текущий этап — execution. Ассистент может выполнять план, но не может объявлять всю задачу завершённой. Следующий допустимый этап — только validation.',
+      rationale: 'Между реализацией и финалом обязателен отдельный этап проверки.'
+    },
+    validation: {
+      title: 'Финал только после успешной проверки',
+      rule: 'Текущий этап — validation. Объявить задачу завершённой можно только после фактической проверки результата по требованиям с явно описанным успешным итогом. При провале проверки нужно вернуться в execution.',
+      rationale: 'Финальный статус должен опираться на проверяемый результат.'
+    },
+    done: {
+      title: 'Завершённая задача неизменяема',
+      rule: 'Текущий этап — done. Нельзя возобновлять реализацию или переводить эту задачу на предыдущий этап; для новой работы нужна новая задача.',
+      rationale: 'Финальное состояние автомата терминально.'
+    }
+  };
+  const now = new Date(0).toISOString();
+  return {
+    id: `task-lifecycle-${phase}`,
+    category: 'business-rule',
+    ...rules[phase],
+    enabled: true,
+    createdAt: now,
+    updatedAt: now
+  };
 }
 
 export function detectTaskCommand(message: string): TaskCommand {
@@ -239,14 +303,23 @@ export class JsonTaskStateStore {
 
   async updateProgress(
     id: string,
-    update: Pick<TaskState, 'phase' | 'currentStep' | 'expectedAction' | 'snapshot'> & { validationPassed?: boolean; validationSummary?: string }
+    update: Pick<TaskState, 'phase' | 'currentStep' | 'expectedAction' | 'snapshot'> & {
+      planApproved?: boolean;
+      validationPassed?: boolean;
+      validationSummary?: string;
+    }
   ) {
     return this.enqueue(async () => {
       const tasks = await this.load();
       const existing = tasks.find((task) => task.id === id);
       if (!existing) return null;
-      const { validationPassed, validationSummary, ...stateUpdate } = update;
-      const transition = resolveTaskPhaseTransition(existing.phase, update.phase, update.validationPassed === true);
+      const { planApproved, validationPassed, validationSummary, ...stateUpdate } = update;
+      const transition = resolveTaskPhaseTransition(
+        existing.phase,
+        update.phase,
+        update.validationPassed === true,
+        update.planApproved === true
+      );
       const phase = transition.phase;
       const transitions = [...(existing.transitions ?? [])];
       let transitionFrom = existing.phase;
@@ -261,13 +334,14 @@ export class JsonTaskStateStore {
       }
       const saved: TaskState = {
         ...existing,
-        ...stateUpdate,
+        ...(transition.allowed ? stateUpdate : {}),
         phase,
         status: phase === 'done' ? 'done' : existing.status,
         activeSessionId: phase === 'done' ? null : existing.activeSessionId,
         updatedAt: new Date().toISOString(),
         transitions,
-        lastValidation: validationSummary
+        lastTransitionError: transition.rejectionReason,
+        lastValidation: transition.allowed && validationSummary
           ? { passed: validationPassed === true, summary: validationSummary, at: new Date().toISOString() }
           : existing.lastValidation
       };

@@ -263,6 +263,7 @@ type TaskState = {
   activeSessionId: string | null;
   snapshot: { goal: string; nextSteps: string[] };
   updatedAt: string;
+  lastTransitionError?: string | null;
 };
 type TasksResponse = { profileId: string; tasks: TaskState[] };
 
@@ -1041,6 +1042,9 @@ export default function App() {
                 <div><dt>Текущий шаг</dt><dd>{currentTask.currentStep}</dd></div>
                 <div><dt>Ожидаемое действие</dt><dd>{currentTask.expectedAction}</dd></div>
               </dl>
+              {currentTask.lastTransitionError && (
+                <p className="task-transition-error" role="alert">{currentTask.lastTransitionError}</p>
+              )}
             </section>
           )}
 

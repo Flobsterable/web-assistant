@@ -1138,6 +1138,16 @@ textarea:disabled {
 .task-state-details dt { color: #7a817e; font-size: 11px; }
 .task-state-details dd { margin: 3px 0 0; color: #28312e; font-size: 13px; }
 
+.task-transition-error {
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid #f1c7bd;
+  border-radius: 8px;
+  color: #8a3328;
+  background: #fff2ef;
+  font-size: 12px;
+}
+
 @media (max-width: 760px) {
   .page-shell {
     padding: 12px;

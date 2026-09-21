@@ -23,8 +23,10 @@ import {
   classifyTaskCommand,
   detectTaskCommand,
   JsonTaskStateStore,
+  createTaskLifecycleInvariant,
   snapshotFromWorkingMemory,
   taskToWorkingWrites,
+  taskPhaseFromMemory,
   resolveTaskPhaseTransition,
   type TaskCommand,
   type TaskPhase,
@@ -838,6 +840,7 @@ function createAgent(
   memoryUsage?: { working: boolean; longTerm: boolean },
   userProfile?: UserProfile
 ) {
+  const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   return new SimpleAgent({
     name: 'Simple LLM Agent',
     provider: agentDefinition.provider,
@@ -846,8 +849,16 @@ function createAgent(
     modelTitle: agentModel.title,
     model: agentModel.model,
     conversationStore: createAgentConversationStore(sessionId),
-    memoryStore: createAgentMemoryStore(sessionId, userProfile?.id),
-    invariantStore: createInvariantStore(),
+    memoryStore,
+    invariantStore: {
+      active: async () => {
+        const [configured, memory] = await Promise.all([
+          createInvariantStore().active(),
+          memoryStore.load()
+        ]);
+        return [createTaskLifecycleInvariant(taskPhaseFromMemory(memory.working)), ...configured];
+      }
+    },
     assessInvariantCompliance: ({ invariants, userRequest, candidateAnswer }) => assessInvariantCompliance({
       invariants,
       userRequest,
@@ -1416,6 +1427,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     await logger.step('conversation_persist', async () => undefined);
     const history = await agent.history();
     let reflection: Awaited<ReturnType<typeof reflectConversationMemory>> | null = null;
+    let requestedTaskPhase: TaskPhase | null = null;
     try {
       reflection = await logger.step('memory_classification', () => reflectConversationMemory({
         history,
@@ -1432,11 +1444,25 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       const previousStage: TaskPhase = previousStageValue === 'execution' || previousStageValue === 'validation' || previousStageValue === 'done'
         ? previousStageValue
         : 'planning';
-      reflection.working.stage = resolveTaskPhaseTransition(
+      requestedTaskPhase = reflection.working.stage;
+      const phaseTransition = resolveTaskPhaseTransition(
         previousStage,
         reflection.working.stage,
-        reflection.working.validationPassed
-      ).phase;
+        reflection.working.validationPassed,
+        reflection.working.planApproved
+      );
+      reflection.working.stage = phaseTransition.phase;
+      if (!phaseTransition.allowed) {
+        reflection.working.state = loadedMemory.working.find((entry) => entry.key === 'task.state')?.value
+          ?? reflection.working.state;
+        reflection.working.currentStep = loadedMemory.working.find((entry) => entry.key === 'task.current_step')?.value
+          ?? reflection.working.currentStep;
+        reflection.working.expectedAction = loadedMemory.working.find((entry) => entry.key === 'task.expected_action')?.value
+          ?? phaseTransition.rejectionReason
+          ?? reflection.working.expectedAction;
+        reflection.working.validationPassed = false;
+        reflection.working.validationSummary = loadedMemory.working.find((entry) => entry.key === 'task.validation')?.value ?? '';
+      }
     }
     const workingWrites = reflection ? workingSummaryToWrites(reflection.working) : [];
     const policyEvents = await logger.step('memory_policy', () => applyMemoryPolicy(reflection?.longTermCandidates ?? [], {
@@ -1487,10 +1513,11 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       const activeTask = resumedTask ?? await taskStore.findActiveForSession(sessionId);
       if (activeTask && reflection) {
         taskState = await taskStore.updateProgress(activeTask.id, {
-          phase,
+          phase: requestedTaskPhase ?? phase,
           currentStep,
           expectedAction,
           snapshot,
+          planApproved: reflection.working.planApproved,
           validationPassed: reflection.working.validationPassed,
           validationSummary: reflection.working.validationSummary
         });

@@ -3,9 +3,10 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { JsonConversationStore, SimpleAgent, type AgentMessage } from './agent.js';
+import { createInvariantRefusal, JsonConversationStore, SimpleAgent, type AgentMessage } from './agent.js';
 import { JsonInvariantStore, parseInvariantAssessment } from './invariant.js';
 import { JsonAgentMemoryStore } from './memory.js';
+import { createTaskLifecycleInvariant } from './task-state.js';
 
 const completion = (answer: string) => ({
   answer,
@@ -124,4 +125,17 @@ test('malformed compliance verdict fails closed', () => {
   const result = parseInvariantAssessment('not json', [invariant]);
   assert.equal(result.status, 'uncertain');
   assert.match(result.explanation, /подтвердить совместимость/);
+});
+
+test('lifecycle violation produces a controlled next-step response', () => {
+  const invariant = createTaskLifecycleInvariant('planning');
+  const answer = createInvariantRefusal([invariant], {
+    status: 'conflict',
+    violations: [{ id: invariant.id, reason: 'План ещё не утверждён.' }],
+    explanation: 'Реализация преждевременна.'
+  }, 'request');
+  assert.match(answer, /Текущий этап — планирование/u);
+  assert.match(answer, /явное утверждение/u);
+  assert.match(answer, /План ещё не утверждён/u);
+  assert.doesNotMatch(answer, /Могу помочь подобрать вариант/u);
 });

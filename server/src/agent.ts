@@ -647,11 +647,22 @@ export class SimpleAgent {
   }
 }
 
-function createInvariantRefusal(invariants: Invariant[], assessment: InvariantAssessment, phase: 'request' | 'response') {
+export function createInvariantRefusal(invariants: Invariant[], assessment: InvariantAssessment, phase: 'request' | 'response') {
   if (assessment.status === 'uncertain') {
     return `Не могу безопасно выполнить этот запрос: ${assessment.explanation} Инварианты обязательны, поэтому при неопределённости я не предлагаю потенциально нарушающее их решение. Уточните запрос или выберите явно совместимый вариант.`;
   }
   const byId = new Map(invariants.map((invariant) => [invariant.id, invariant]));
+  const lifecycleViolation = assessment.violations.find((violation) => violation.id.startsWith('task-lifecycle-'));
+  if (lifecycleViolation) {
+    const lifecyclePhase = lifecycleViolation.id.slice('task-lifecycle-'.length);
+    const reaction: Record<string, string> = {
+      planning: 'Текущий этап — планирование. Сначала нужно подготовить или уточнить план и получить его явное утверждение; только затем можно переходить к реализации.',
+      execution: 'Текущий этап — реализация. Следующий допустимый шаг — передать полученный результат на отдельную проверку, а не объявлять задачу завершённой.',
+      validation: 'Текущий этап — проверка. Сначала нужно фактически проверить результат по требованиям: успешная проверка разрешит финал, неуспешная вернёт задачу в реализацию.',
+      done: 'Задача уже завершена, и это терминальное состояние. Для дополнительной реализации нужно создать новую задачу.'
+    };
+    return `${reaction[lifecyclePhase] ?? 'Запрошенный переход состояния недопустим.'}\n\nПричина: ${lifecycleViolation.reason}`;
+  }
   const details = assessment.violations.map((violation) => {
     const invariant = byId.get(violation.id);
     return `- «${invariant?.title ?? violation.id}»: ${violation.reason || invariant?.rule || 'решение нарушает обязательное правило'}`;
