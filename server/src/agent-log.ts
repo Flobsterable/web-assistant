@@ -14,6 +14,13 @@ export type AgentLogStep = {
   inputTokens?: number;
   outputTokens?: number;
   memoryEvents?: MemoryEvent[];
+  invariantCompliance?: {
+    status: 'allowed' | 'conflict' | 'uncertain';
+    phase: 'request' | 'response' | null;
+    appliedIds: string[];
+    violations: Array<{ id: string; reason: string }>;
+    explanation: string;
+  };
   error?: string;
 };
 

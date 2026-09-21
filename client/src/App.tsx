@@ -20,6 +20,7 @@ type AgentResponse = {
   turnId?: string;
   memoryEvents?: MemoryEvent[];
   task?: TaskState | null;
+  invariantCompliance?: InvariantCompliance;
 };
 
 type AgentErrorResponse = {
@@ -158,6 +159,27 @@ type ContextManagementReport = {
     applied: boolean;
     tokens: number;
   };
+  invariants: { items: number; tokens: number; appliedIds: string[]; mandatory: true };
+};
+
+type InvariantCategory = 'architecture' | 'technical-decision' | 'stack-constraint' | 'business-rule';
+type Invariant = {
+  id: string;
+  category: InvariantCategory;
+  title: string;
+  rule: string;
+  rationale: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+type InvariantsResponse = { scope: string; storage: string; invariants: Invariant[] };
+type InvariantCompliance = {
+  status: 'allowed' | 'conflict' | 'uncertain';
+  phase: 'request' | 'response' | null;
+  appliedIds: string[];
+  violations: Array<{ id: string; reason: string }>;
+  explanation: string;
 };
 
 type HistoryTokenStats = {
@@ -375,6 +397,12 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             <span>Память задачи: {message.meta.contextManagement.memory.appliedWorkingIds.length}</span>
             <span>Долгая память: {message.meta.contextManagement.memory.appliedLongTermIds.length}</span>
             <span>Профиль: {message.meta.contextManagement.personalization.applied ? message.meta.contextManagement.personalization.profileName : 'не применён'}</span>
+            <span>
+              Инварианты: {message.meta.contextManagement.invariants.appliedIds.length > 0
+                ? `${message.meta.contextManagement.invariants.appliedIds.length}, применены обязательно`
+                : 'не заданы'}
+            </span>
+            <span>Проверка: {message.meta.invariantCompliance?.status === 'allowed' ? 'соблюдены' : message.meta.invariantCompliance?.status ?? '—'}</span>
             <span>Рабочая: {message.meta.contextManagement.memory.workingEnabled ? 'включена' : 'выключена'}</span>
             <span>Долговременная: {message.meta.contextManagement.memory.longTermEnabled ? 'включена' : 'выключена'}</span>
             <span>Стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>
@@ -435,6 +463,12 @@ export default function App() {
   const [profileStyle, setProfileStyle] = useState('');
   const [profileFormat, setProfileFormat] = useState('');
   const [profileConstraints, setProfileConstraints] = useState('');
+  const [invariants, setInvariants] = useState<Invariant[]>([]);
+  const [invariantCategory, setInvariantCategory] = useState<InvariantCategory>('architecture');
+  const [invariantTitle, setInvariantTitle] = useState('');
+  const [invariantRule, setInvariantRule] = useState('');
+  const [invariantRationale, setInvariantRationale] = useState('');
+  const [isSavingInvariant, setIsSavingInvariant] = useState(false);
 
   const selectedModel = useMemo(
     () => config?.models.find((model) => model.id === selectedModelId) ?? config?.models[0],
@@ -465,14 +499,15 @@ export default function App() {
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
         const memoryQuery = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
-        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse, tasksResponse] = await Promise.all([
+        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse, tasksResponse, invariantsResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
           fetch('/api/profiles', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
           fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
           fetch(`/api/agent/memory?${memoryQuery}`, { signal: controller.signal }),
           fetch(`/api/agent/memory/pending?${memoryQuery}`, { signal: controller.signal }),
-          fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`, { signal: controller.signal })
+          fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`, { signal: controller.signal }),
+          fetch('/api/invariants', { signal: controller.signal })
         ]);
         const data = (await configResponse.json()) as AppConfig;
 
@@ -528,6 +563,7 @@ export default function App() {
           setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
         }
         if (tasksResponse.ok) setTasks(((await tasksResponse.json()) as TasksResponse).tasks);
+        if (invariantsResponse.ok) setInvariants(((await invariantsResponse.json()) as InvariantsResponse).invariants);
 
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return;
@@ -707,6 +743,68 @@ export default function App() {
       setError(caughtError instanceof Error ? caughtError.message : 'Не удалось сохранить память.');
     } finally {
       setIsSavingMemory(false);
+    }
+  }
+
+  async function refreshInvariants() {
+    const response = await fetch('/api/invariants');
+    const data = (await response.json()) as InvariantsResponse & { error?: string };
+    if (!response.ok) throw new Error(data.error ?? 'Не удалось загрузить инварианты.');
+    setInvariants(data.invariants);
+  }
+
+  async function handleSaveInvariant(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError('');
+    setIsSavingInvariant(true);
+    try {
+      const response = await fetch('/api/invariants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category: invariantCategory,
+          title: invariantTitle,
+          rule: invariantRule,
+          rationale: invariantRationale,
+          enabled: true
+        })
+      });
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(data.error ?? 'Не удалось сохранить инвариант.');
+      setInvariantTitle('');
+      setInvariantRule('');
+      setInvariantRationale('');
+      await refreshInvariants();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось сохранить инвариант.');
+    } finally {
+      setIsSavingInvariant(false);
+    }
+  }
+
+  async function handleToggleInvariant(invariant: Invariant) {
+    setError('');
+    try {
+      const response = await fetch(`/api/invariants/${encodeURIComponent(invariant.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...invariant, enabled: !invariant.enabled })
+      });
+      if (!response.ok) throw new Error('Не удалось изменить инвариант.');
+      await refreshInvariants();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось изменить инвариант.');
+    }
+  }
+
+  async function handleDeleteInvariant(id: string) {
+    setError('');
+    try {
+      const response = await fetch(`/api/invariants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error('Не удалось удалить инвариант.');
+      await refreshInvariants();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось удалить инвариант.');
     }
   }
 
@@ -978,6 +1076,7 @@ export default function App() {
                 <div><strong>{memory?.layers.shortTerm.messages.length ?? messages.length}</strong><span>сообщений</span></div>
                 <div><strong>{memory?.layers.working.entries.length ? 'Готов' : '—'}</strong><span>контекст</span></div>
                 <div><strong>{memory?.layers.longTerm.entries.length ?? 0}</strong><span>надолго</span></div>
+                <div><strong>{invariants.filter((item) => item.enabled).length}</strong><span>инвариантов</span></div>
                 {pendingMemory.length > 0 && <div className="attention"><strong>{pendingMemory.length}</strong><span>ждёт решения</span></div>}
               </div>
               <button
@@ -1074,6 +1173,56 @@ export default function App() {
                     <label className="profile-constraints">Что учитывать <small>необязательно, по одному на строку</small><textarea value={profileConstraints} onChange={(event) => setProfileConstraints(event.target.value)} rows={3} placeholder="Не любит эмодзи" /></label>
                     <button type="submit">{isCreatingProfile ? 'Создать пользователя' : 'Сохранить'}</button>
                   </form>
+                </div>
+                <div className="invariant-editor">
+                  <div className="memory-settings-heading">
+                    <strong>Инварианты</strong>
+                    <span>Добавлять необязательно. Если активные инварианты заданы, ассистент обязан применять их во всех ответах</span>
+                  </div>
+                  <form className="memory-form" onSubmit={handleSaveInvariant}>
+                    <label>
+                      Категория
+                      <select value={invariantCategory} onChange={(event) => setInvariantCategory(event.target.value as InvariantCategory)}>
+                        <option value="architecture">Архитектура</option>
+                        <option value="technical-decision">Техническое решение</option>
+                        <option value="stack-constraint">Ограничение стека</option>
+                        <option value="business-rule">Бизнес-правило</option>
+                      </select>
+                    </label>
+                    <label>
+                      Название
+                      <input value={invariantTitle} onChange={(event) => setInvariantTitle(event.target.value)} placeholder="Например: Только TypeScript" maxLength={120} required />
+                    </label>
+                    <label className="memory-value-field">
+                      Правило
+                      <input value={invariantRule} onChange={(event) => setInvariantRule(event.target.value)} placeholder="Не использовать JavaScript без типизации" maxLength={2000} required />
+                    </label>
+                    <label className="memory-value-field">
+                      Почему это важно <small>необязательно</small>
+                      <input value={invariantRationale} onChange={(event) => setInvariantRationale(event.target.value)} placeholder="Причина или контекст решения" maxLength={1000} />
+                    </label>
+                    <button type="submit" disabled={isSavingInvariant}>{isSavingInvariant ? 'Сохраняю…' : 'Добавить инвариант'}</button>
+                  </form>
+                  {invariants.length > 0 && (
+                    <div className="memory-entry-group">
+                      {invariants.map((invariant) => (
+                        <div className={`memory-entry ${invariant.enabled ? '' : 'disabled'}`} key={invariant.id}>
+                          <div>
+                            <span>{invariant.category}</span>
+                            <b>{invariant.title}</b>
+                            <p>{invariant.rule}</p>
+                          </div>
+                          <div className="pending-memory-actions">
+                            <button type="button" onClick={() => void handleToggleInvariant(invariant)}>{invariant.enabled ? 'Отключить' : 'Включить'}</button>
+                            <button type="button" onClick={() => void handleDeleteInvariant(invariant.id)}>Удалить</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {invariants.length === 0 && (
+                    <p className="invariant-empty">Инварианты не заданы — ассистент работает без этого слоя ограничений.</p>
+                  )}
                 </div>
                 <div className="memory-settings-heading">
                   <strong>Добавить вручную</strong>

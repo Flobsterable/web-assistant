@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AgentMemoryStore, MemoryEntry, MemorySnapshot } from './memory.js';
 import { createUserProfileMessage, defaultUserProfile, type UserProfile } from './profile.js';
+import { createInvariantMessage, type Invariant, type InvariantAssessment } from './invariant.js';
 import type { AgentTokenReport, TokenBudget, TokenPricing } from './token-meter.js';
 import {
   createTokenReport,
@@ -51,6 +52,17 @@ export type ConversationContextReport = {
     applied: boolean;
     tokens: number;
   };
+  invariants: {
+    items: number;
+    tokens: number;
+    appliedIds: string[];
+    mandatory: true;
+  };
+};
+
+export type InvariantComplianceReport = InvariantAssessment & {
+  phase: 'request' | 'response' | null;
+  appliedIds: string[];
 };
 
 export type AgentCompletionResult = {
@@ -65,6 +77,7 @@ export type AgentCompletionResult = {
   priceCurrency: string;
   elapsedMs: number;
   finishReason: string | null;
+  invariantCompliance?: InvariantComplianceReport;
 };
 
 export type AgentRunResult = AgentCompletionResult & {
@@ -110,6 +123,12 @@ type SimpleAgentOptions = {
   useWorkingMemory?: boolean;
   useLongTermMemory?: boolean;
   userProfile?: UserProfile;
+  invariantStore?: { active: () => Promise<Invariant[]> };
+  assessInvariantCompliance?: (params: {
+    invariants: Invariant[];
+    userRequest: string;
+    candidateAnswer?: string;
+  }) => Promise<InvariantAssessment>;
 };
 
 type PersistedConversation = {
@@ -244,6 +263,8 @@ export class SimpleAgent {
   private readonly useWorkingMemory: boolean;
   private readonly useLongTermMemory: boolean;
   private readonly userProfile: UserProfile;
+  private readonly invariantStore?: { active: () => Promise<Invariant[]> };
+  private readonly assessInvariants?: SimpleAgentOptions['assessInvariantCompliance'];
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -263,6 +284,8 @@ export class SimpleAgent {
     this.useWorkingMemory = options.useWorkingMemory ?? true;
     this.useLongTermMemory = options.useLongTermMemory ?? true;
     this.userProfile = options.userProfile ?? defaultUserProfile;
+    this.invariantStore = options.invariantStore;
+    this.assessInvariants = options.assessInvariantCompliance;
   }
 
   async history() {
@@ -284,9 +307,12 @@ export class SimpleAgent {
       throw new Error('User request is required.');
     }
 
-    const fullHistory = await this.conversationStore.load();
-    const memory = await this.memoryStore.load();
-    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, memory);
+    const [fullHistory, memory, invariants] = await Promise.all([
+      this.conversationStore.load(),
+      this.memoryStore.load(),
+      this.invariantStore?.active() ?? Promise.resolve([])
+    ]);
+    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, memory, invariants);
     const initialTokenReport = createTokenReport({
       systemPrompt: this.systemPrompt,
       selectedHistory: preparedContext.messages,
@@ -301,6 +327,11 @@ export class SimpleAgent {
         `Запрос не помещается в контекст модели: превышение ${initialTokenReport.overflowTokens} токенов. Сократите запрос или увеличьте MODEL_MAX_CONTEXT_TOKENS.`,
         initialTokenReport
       );
+    }
+
+    const requestAssessment = await this.assess(normalizedRequest, invariants);
+    if (requestAssessment.status !== 'allowed') {
+      return this.persistRefusal(normalizedRequest, invariants, requestAssessment, preparedContext, initialTokenReport, 'request');
     }
 
     const completion = await this.complete(
@@ -318,6 +349,11 @@ export class SimpleAgent {
       { temperature: this.temperature }
     );
 
+    const responseAssessment = await this.assess(normalizedRequest, invariants, completion.answer);
+    if (responseAssessment.status !== 'allowed') {
+      return this.persistRefusal(normalizedRequest, invariants, responseAssessment, preparedContext, initialTokenReport, 'response');
+    }
+
     await this.conversationStore.appendMany([
       {
         role: 'user',
@@ -331,6 +367,11 @@ export class SimpleAgent {
 
     return {
       ...completion,
+      invariantCompliance: {
+        ...responseAssessment,
+        phase: null,
+        appliedIds: invariants.map((invariant) => invariant.id)
+      },
       tokenReport: createTokenReport({
         systemPrompt: this.systemPrompt,
         selectedHistory: preparedContext.messages,
@@ -359,9 +400,12 @@ export class SimpleAgent {
       throw new Error('User request is required.');
     }
 
-    const fullHistory = await this.conversationStore.load();
-    const memory = await this.memoryStore.load();
-    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, memory);
+    const [fullHistory, memory, invariants] = await Promise.all([
+      this.conversationStore.load(),
+      this.memoryStore.load(),
+      this.invariantStore?.active() ?? Promise.resolve([])
+    ]);
+    const preparedContext = await this.prepareContext(fullHistory, normalizedRequest, memory, invariants);
 
     return createTokenReport({
       systemPrompt: this.systemPrompt,
@@ -376,16 +420,19 @@ export class SimpleAgent {
   private async prepareContext(
     history: StoredAgentMessage[],
     nextUserMessage: string,
-    memory: MemorySnapshot
+    memory: MemorySnapshot,
+    invariants: Invariant[]
   ): Promise<PreparedContext> {
     const exactMessages = this.selectMessagesForContext(history.slice(-this.keepLastMessages), nextUserMessage);
     const activeLongTerm = this.useLongTermMemory ? memory.longTerm : [];
     const activeWorking = this.useWorkingMemory ? memory.working : [];
     const profileMessage = createUserProfileMessage(this.userProfile);
+    const invariantMessage = createInvariantMessage(invariants);
     const longTermMessages = createMemoryMessages('long-term', activeLongTerm);
     const workingMessages = createMemoryMessages('working', activeWorking);
-    const messages = [profileMessage, ...longTermMessages, ...workingMessages, ...exactMessages.map(toAgentMessage)];
+    const messages = [...(invariantMessage ? [invariantMessage] : []), profileMessage, ...longTermMessages, ...workingMessages, ...exactMessages.map(toAgentMessage)];
     const priorities = [
+      ...(invariantMessage ? [6] : []),
       5,
       ...longTermMessages.map(() => 1),
       ...activeWorking
@@ -409,7 +456,8 @@ export class SimpleAgent {
         contextMessages,
         exactMessages,
         nextUserMessage,
-        memory
+        memory,
+        invariants
       })
     };
   }
@@ -476,6 +524,7 @@ export class SimpleAgent {
     exactMessages: StoredAgentMessage[];
     nextUserMessage: string;
     memory: MemorySnapshot;
+    invariants: Invariant[];
   }): ConversationContextReport {
     const systemPromptTokens = estimateMessageTokens({ role: 'system', content: this.systemPrompt });
     const currentRequestTokens = estimateMessageTokens({ role: 'user', content: params.nextUserMessage });
@@ -484,6 +533,7 @@ export class SimpleAgent {
     const workingMessages = createMemoryMessages('working', params.memory.working);
     const longTermMessages = createMemoryMessages('long-term', params.memory.longTerm);
     const profileMessage = createUserProfileMessage(this.userProfile);
+    const invariantMessage = createInvariantMessage(params.invariants);
     const appliedWorkingIds = memoryIdsPresentInContext(params.contextMessages, params.memory.working);
     const appliedLongTermIds = memoryIdsPresentInContext(params.contextMessages, params.memory.longTerm);
     const dropped = [
@@ -526,9 +576,94 @@ export class SimpleAgent {
         profileName: this.userProfile.name,
         applied: params.contextMessages.some((message) => message.content === profileMessage.content),
         tokens: profileTokens
+      },
+      invariants: {
+        items: params.invariants.length,
+        tokens: invariantMessage ? estimateMessageTokens(invariantMessage) : 0,
+        appliedIds: invariantMessage && params.contextMessages.some((message) => message.content === invariantMessage.content)
+          ? params.invariants.map((item) => item.id)
+          : [],
+        mandatory: true
       }
     };
   }
+
+  private async assess(userRequest: string, invariants: Invariant[], candidateAnswer?: string): Promise<InvariantAssessment> {
+    if (invariants.length === 0) return { status: 'allowed', violations: [], explanation: 'Активных инвариантов нет.' };
+    if (!this.assessInvariants) {
+      return { status: 'uncertain', violations: [], explanation: 'Проверка инвариантов недоступна.' };
+    }
+    try {
+      return await this.assessInvariants({ invariants, userRequest, candidateAnswer });
+    } catch {
+      return { status: 'uncertain', violations: [], explanation: 'Не удалось надёжно проверить соблюдение инвариантов.' };
+    }
+  }
+
+  private async persistRefusal(
+    userRequest: string,
+    invariants: Invariant[],
+    assessment: InvariantAssessment,
+    preparedContext: PreparedContext,
+    tokenReport: AgentTokenReport,
+    phase: 'request' | 'response'
+  ): Promise<AgentRunResult> {
+    const answer = createInvariantRefusal(invariants, assessment, phase);
+    await this.conversationStore.appendMany([
+      { role: 'user', content: userRequest },
+      { role: 'assistant', content: answer }
+    ]);
+    const outputTokens = estimateTokens(answer);
+    return {
+      answer,
+      inputTokens: tokenReport.inputTokens,
+      outputTokens,
+      totalTokens: tokenReport.inputTokens + outputTokens,
+      tokenSource: 'estimated',
+      tokenReport: createTokenReport({
+        systemPrompt: this.systemPrompt,
+        selectedHistory: preparedContext.messages,
+        fullHistory: [],
+        currentRequest: userRequest,
+        outputText: answer,
+        pricing: this.tokenPricing,
+        budget: this.tokenBudget
+      }),
+      contextManagement: preparedContext.report,
+      invariantCompliance: {
+        ...assessment,
+        phase,
+        appliedIds: invariants.map((invariant) => invariant.id)
+      },
+      cost: null,
+      priceCurrency: this.tokenPricing.priceCurrency,
+      elapsedMs: 0,
+      finishReason: 'invariant_refusal',
+      agentName: this.name,
+      agentProvider: this.provider,
+      modelTitle: this.modelTitle,
+      model: this.model
+    };
+  }
+}
+
+function createInvariantRefusal(invariants: Invariant[], assessment: InvariantAssessment, phase: 'request' | 'response') {
+  if (assessment.status === 'uncertain') {
+    return `Не могу безопасно выполнить этот запрос: ${assessment.explanation} Инварианты обязательны, поэтому при неопределённости я не предлагаю потенциально нарушающее их решение. Уточните запрос или выберите явно совместимый вариант.`;
+  }
+  const byId = new Map(invariants.map((invariant) => [invariant.id, invariant]));
+  const details = assessment.violations.map((violation) => {
+    const invariant = byId.get(violation.id);
+    return `- «${invariant?.title ?? violation.id}»: ${violation.reason || invariant?.rule || 'решение нарушает обязательное правило'}`;
+  });
+  const subject = phase === 'request' ? 'запрос' : 'подготовленное решение';
+  return [
+    `Не могу выполнить ${subject}: он конфликтует с обязательными инвариантами.`,
+    '',
+    ...details,
+    '',
+    'Могу помочь подобрать вариант, который соблюдает эти ограничения.'
+  ].join('\n');
 }
 
 function memoryIdsPresentInContext(context: AgentMessage[], entries: MemoryEntry[]) {

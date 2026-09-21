@@ -423,6 +423,9 @@ select {
 .memory-entry-group > strong { color: #52636e; font-size: 11px; }
 .memory-empty { color: #9aa6ad; font-size: 11px; }
 .memory-entry { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #edf1f3; padding-top: 7px; }
+.memory-entry.disabled { opacity: .55; }
+.invariant-editor { display: grid; gap: 9px; border-top: 1px solid #e0e8ec; padding-top: 12px; }
+.invariant-empty { margin: 0; color: #87949c; font-size: 11px; }
 .memory-entry div { min-width: 0; }
 .memory-entry span { margin-right: 6px; color: #87949c; font-size: 9px; text-transform: uppercase; }
 .memory-entry b { color: #253540; font-size: 11px; }

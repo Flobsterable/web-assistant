@@ -18,6 +18,7 @@ import { reflectConversationMemory, workingSummaryToWrites } from './memory-refl
 import { JsonPendingMemoryStore } from './pending-memory.js';
 import { JsonUserProfileStore, normalizeProfileId, validateUserProfileInput, type UserProfile } from './profile.js';
 import { AgentTurnLogger, listAgentLogs, readAgentLog } from './agent-log.js';
+import { assessInvariantCompliance, JsonInvariantStore, validateInvariantInput } from './invariant.js';
 import {
   classifyTaskCommand,
   detectTaskCommand,
@@ -377,8 +378,10 @@ const pendingMemoryPath = path.join(agentDataPath, 'memory', 'pending');
 const profilesPath = path.join(agentDataPath, 'profiles');
 const agentLogsPath = path.join(agentDataPath, 'agent-logs');
 const tasksPath = path.join(agentDataPath, 'tasks');
+const invariantsFilePath = path.join(agentDataPath, 'invariants.json');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
+const invariantStore = new JsonInvariantStore(invariantsFilePath);
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
@@ -644,6 +647,10 @@ function createTaskStateStore(profileId: string) {
   return new JsonTaskStateStore(path.join(tasksPath, `${normalizedProfileId}.json`), normalizedProfileId);
 }
 
+function createInvariantStore() {
+  return invariantStore;
+}
+
 function readMemoryConfidenceThreshold() {
   const value = readOptionalNumberEnv('MEMORY_CONFIDENCE_THRESHOLD') ?? 0.75;
   return Math.min(1, value);
@@ -840,6 +847,13 @@ function createAgent(
     model: agentModel.model,
     conversationStore: createAgentConversationStore(sessionId),
     memoryStore: createAgentMemoryStore(sessionId, userProfile?.id),
+    invariantStore: createInvariantStore(),
+    assessInvariantCompliance: ({ invariants, userRequest, candidateAnswer }) => assessInvariantCompliance({
+      invariants,
+      userRequest,
+      candidateAnswer,
+      complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
+    }),
     userProfile,
     tokenPricing: createTokenPricing(agentModel),
     tokenBudget: createTokenBudget(agentModel),
@@ -922,6 +936,50 @@ app.delete('/api/profiles/:id', async (req: Request, res: Response) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to delete profile.';
     return res.status(message.includes('Default') ? 400 : 500).json({ error: message });
+  }
+});
+
+app.get('/api/invariants', async (_req: Request, res: Response) => {
+  try {
+    return res.json({
+      scope: 'all-dialogues',
+      storage: 'invariants.json',
+      invariants: await createInvariantStore().list()
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load invariants.' });
+  }
+});
+
+app.post('/api/invariants', async (req: Request, res: Response) => {
+  const input = validateInvariantInput(req.body);
+  if (typeof input === 'string') return res.status(400).json({ error: input });
+  try {
+    return res.status(201).json({ invariant: await createInvariantStore().save(input) });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save invariant.' });
+  }
+});
+
+app.put('/api/invariants/:id', async (req: Request, res: Response) => {
+  const input = validateInvariantInput(req.body);
+  if (typeof input === 'string') return res.status(400).json({ error: input });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    return res.json({ invariant: await createInvariantStore().save(input, id) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to update invariant.';
+    return res.status(message === 'Invariant not found.' ? 404 : 500).json({ error: message });
+  }
+});
+
+app.delete('/api/invariants/:id', async (req: Request, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    const removed = await createInvariantStore().remove(id);
+    return removed ? res.status(204).send() : res.status(404).json({ error: 'Invariant not found.' });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete invariant.' });
   }
 });
 
@@ -1347,6 +1405,9 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     const result = await logger.step('provider_request', () => agent.run(request.message), {
       provider: agentDefinition.provider,
       model: agentModel.model
+    });
+    await logger.step('invariant_check', async () => result.invariantCompliance ?? null, {
+      invariantCompliance: result.invariantCompliance
     });
     await logger.annotate('provider_request', {
       inputTokens: result.inputTokens ?? undefined,
