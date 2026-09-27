@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -51,6 +51,63 @@ test('planner MCP exposes tools and keeps profile data isolated', async () => {
     assert.match(other.content[0].text, /"count": 0/);
   } finally {
     await cleanup();
+  }
+});
+
+test('planner MCP builds, validates and saves a Markdown report as a composed pipeline', async () => {
+  const { store, cleanup } = await fixture();
+  const reportDirectory = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-'));
+  try {
+    const mcp = new PlannerMcpServer(store, reportDirectory);
+    store.createTodos('default', [
+      { title: 'Исправить критическую ошибку', priority: 'high', dueAt: '2020-01-01T00:00:00.000Z', tags: ['backend'] },
+      { title: 'Обновить README', priority: 'normal' }
+    ]);
+
+    const listed = await mcp.callTool('planner_list_todos', { profileId: 'default', status: 'pending' });
+    const todos = (listed.structuredContent as { todos: unknown[] }).todos;
+    const built = await mcp.callTool('planner_build_report', { profileId: 'default', todos });
+    const reportId = (built.structuredContent as { reportId: string }).reportId;
+    const validated = await mcp.callTool('planner_validate_report', { profileId: 'default', reportId });
+    const validation = validated.structuredContent as { validationId: string; valid: boolean; issues: string[] };
+    assert.equal(validation.valid, true);
+    assert.deepEqual(validation.issues, []);
+
+    const saved = await mcp.callTool('planner_save_report', {
+      profileId: 'default', validationId: validation.validationId, fileName: '../weekly overview.md'
+    });
+    assert.equal(saved.isError, undefined);
+    const savedPayload = saved.structuredContent as { path: string; markdown: string; displayInAgent: boolean };
+    const savedPath = savedPayload.path;
+    assert.equal(path.dirname(savedPath), path.join(reportDirectory, 'default'));
+    assert.equal(path.basename(savedPath), 'weekly-overview.md');
+    const contents = await readFile(savedPath, 'utf8');
+    assert.match(contents, /# Отчёт по задачам/);
+    assert.match(contents, /Просроченные/);
+    assert.match(contents, /Исправить критическую ошибку/);
+    assert.match(contents, /## Рекомендация/);
+    assert.equal(savedPayload.markdown, contents.trim());
+    assert.equal(savedPayload.displayInAgent, true);
+  } finally {
+    await cleanup();
+    await rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test('planner MCP refuses to save a report without a valid server-side validation ID', async () => {
+  const { store, cleanup } = await fixture();
+  const reportDirectory = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-'));
+  try {
+    const mcp = new PlannerMcpServer(store, reportDirectory);
+    const saved = await mcp.callTool('planner_save_report', {
+      profileId: 'default',
+      validationId: 'missing-validation'
+    });
+    assert.equal(saved.isError, true);
+    assert.match(saved.content[0].text, /не найден или устарел/i);
+  } finally {
+    await cleanup();
+    await rm(reportDirectory, { recursive: true, force: true });
   }
 });
 

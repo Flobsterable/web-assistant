@@ -178,6 +178,27 @@ function normalizePositiveInteger(value: number | undefined, fallback: number) {
   return Math.floor(value);
 }
 
+function savedReportMarkdown(calls: AgentToolCall[]): string | null {
+  for (const call of [...calls].reverse()) {
+    if (call.name !== 'planner_save_report' || call.isError) continue;
+    try {
+      const payload = JSON.parse(call.result) as Record<string, unknown>;
+      if (payload.saved === true && payload.displayInAgent === true && typeof payload.markdown === 'string' && payload.markdown.trim()) {
+        return payload.markdown.trim();
+      }
+    } catch {
+      // A malformed tool result must not break the main agent response.
+    }
+  }
+  return null;
+}
+
+function withSavedReport(answer: string, calls: AgentToolCall[]): string {
+  const markdown = savedReportMarkdown(calls);
+  if (!markdown || answer.includes(markdown)) return answer;
+  return `${answer.trim()}\n\n${markdown}`.trim();
+}
+
 export class JsonConversationStore implements ConversationStore {
   private writeQueue = Promise.resolve();
 
@@ -344,12 +365,21 @@ export class SimpleAgent {
       );
     }
 
-    const requestAssessment = await this.assess(normalizedRequest, invariants);
-    if (requestAssessment.status !== 'allowed') {
-      return this.persistRefusal(normalizedRequest, invariants, requestAssessment, preparedContext, initialTokenReport, 'request');
+    const lifecycleInvariants = invariants.filter((invariant) => invariant.id.startsWith('task-lifecycle-'));
+    const regularInvariants = invariants.filter((invariant) => !invariant.id.startsWith('task-lifecycle-'));
+    const regularRequestAssessment = await this.assess(normalizedRequest, regularInvariants);
+    if (regularRequestAssessment.status !== 'allowed') {
+      return this.persistRefusal(normalizedRequest, regularInvariants, regularRequestAssessment, preparedContext, initialTokenReport, 'request');
     }
 
     const toolResolution = await this.toolRuntime?.resolve(normalizedRequest) ?? { contextMessages: [], calls: [] };
+    const performedPlannerAction = toolResolution.calls.some((call) => call.name.startsWith('planner_'));
+    if (!performedPlannerAction && lifecycleInvariants.length > 0) {
+      const lifecycleRequestAssessment = await this.assess(normalizedRequest, lifecycleInvariants);
+      if (lifecycleRequestAssessment.status !== 'allowed') {
+        return this.persistRefusal(normalizedRequest, lifecycleInvariants, lifecycleRequestAssessment, preparedContext, initialTokenReport, 'request');
+      }
+    }
     const completion = await this.complete(
       [
         {
@@ -365,12 +395,12 @@ export class SimpleAgent {
       ],
       { temperature: this.temperature }
     );
+    const answer = withSavedReport(completion.answer, toolResolution.calls);
 
-    const performedPlannerAction = toolResolution.calls.some((call) => call.name.startsWith('planner_'));
     const responseInvariants = performedPlannerAction
-      ? invariants.filter((invariant) => !invariant.id.startsWith('task-lifecycle-'))
+      ? regularInvariants
       : invariants;
-    const responseAssessment = await this.assess(normalizedRequest, responseInvariants, completion.answer);
+    const responseAssessment = await this.assess(normalizedRequest, responseInvariants, answer);
     if (responseAssessment.status !== 'allowed') {
       return this.persistRefusal(normalizedRequest, responseInvariants, responseAssessment, preparedContext, initialTokenReport, 'response');
     }
@@ -382,12 +412,13 @@ export class SimpleAgent {
       },
       {
         role: 'assistant',
-        content: completion.answer
+        content: answer
       }
     ]);
 
     return {
       ...completion,
+      answer,
       invariantCompliance: {
         ...responseAssessment,
         phase: null,
@@ -398,7 +429,7 @@ export class SimpleAgent {
         selectedHistory: preparedContext.messages,
         fullHistory,
         currentRequest: normalizedRequest,
-        outputText: completion.answer,
+        outputText: answer,
         apiInputTokens: completion.inputTokens,
         apiOutputTokens: completion.outputTokens,
         apiTotalTokens: completion.totalTokens,

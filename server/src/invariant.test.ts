@@ -140,7 +140,7 @@ test('lifecycle violation produces a controlled next-step response', () => {
   assert.doesNotMatch(answer, /Могу помочь подобрать вариант/u);
 });
 
-test('a completed Planner action is not rejected by the task lifecycle invariant', async () => {
+test('a direct Planner report action bypasses the task lifecycle invariant at the planning phase', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-lifecycle-'));
   try {
     const lifecycle = createTaskLifecycleInvariant('planning');
@@ -161,21 +161,62 @@ test('a completed Planner action is not rejected by the task lifecycle invariant
       },
       toolRuntime: {
         resolve: async () => ({
-          contextMessages: [{ role: 'system', content: 'Список дел очищен.' }],
-          calls: [{ name: 'planner_delete_todos', arguments: { all: true }, result: '{"deletedCount":2}', isError: false }]
+          contextMessages: [{ role: 'system', content: 'Отчёт сохранён.' }],
+          calls: [{
+            name: 'planner_save_report', arguments: {}, isError: false,
+            result: JSON.stringify({
+              saved: true,
+              path: '/tmp/todos.md',
+              markdown: '# Отчёт по задачам\n\n- Незавершённых: 2',
+              displayInAgent: true
+            })
+          }]
         })
       },
       tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
       tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
-      complete: async () => completion('Список дел очищен.')
+      complete: async () => completion('Отчёт сохранён в `/tmp/todos.md`.')
     });
 
-    const result = await agent.run('Очисти список дел');
-    assert.equal(checks, 1);
-    assert.equal(result.answer, 'Список дел очищен.');
+    const result = await agent.run('Составь отчёт по моим незавершённым задачам и сохрани его.');
+    assert.equal(checks, 0);
+    assert.match(result.answer, /Отчёт сохранён/);
+    assert.match(result.answer, /# Отчёт по задачам/);
     assert.equal(result.finishReason, 'stop');
     assert.deepEqual(result.invariantCompliance?.appliedIds, []);
-    assert.equal(result.toolCalls?.[0]?.name, 'planner_delete_todos');
+    assert.equal(result.toolCalls?.[0]?.name, 'planner_save_report');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('regular invariants are checked before a Planner write is executed', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-business-rule-'));
+  try {
+    const invariant = {
+      id: 'business-no-reports', category: 'business-rule' as const, title: 'Отчёты запрещены',
+      rule: 'Не создавать отчёты.', rationale: '', enabled: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    };
+    let toolCalls = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore: { active: async () => [createTaskLifecycleInvariant('planning'), invariant] },
+      assessInvariantCompliance: async ({ invariants }) => invariants.some((item) => item.id === invariant.id)
+        ? { status: 'conflict', violations: [{ id: invariant.id, reason: 'Отчёты запрещены.' }], explanation: 'Конфликт бизнес-правила.' }
+        : { status: 'allowed', violations: [], explanation: 'Разрешено.' },
+      toolRuntime: { resolve: async () => { toolCalls += 1; return { contextMessages: [], calls: [] }; } },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Не должно вызываться.')
+    });
+
+    const result = await agent.run('Составь и сохрани отчёт.');
+    assert.equal(toolCalls, 0);
+    assert.equal(result.invariantCompliance?.status, 'conflict');
+    assert.match(result.answer, /Отчёты запрещены/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -80,3 +80,49 @@ test('agent runtime selects an MCP tool, calls it and returns grounded context',
   assert.match(resolved.contextMessages[0].content, /Demo/);
   assert.match(resolved.contextMessages[0].content, /untrusted data/i);
 });
+
+test('agent runtime automatically composes multiple MCP tools and passes results between them', async () => {
+  const todos = [{ id: 'todo-1', title: 'Подготовить отчёт', status: 'pending', priority: 'high' }];
+  const report = {
+    title: 'Отчёт по задачам', generatedAt: '2026-09-28T10:00:00.000Z', markdown: '# Отчёт',
+    todoCount: 1, sourceTodoIds: ['todo-1'], metrics: { pending: 1, completed: 0, overdue: 0, highPriority: 1 }
+  };
+  const reportId = 'report-1';
+  const validationId = 'validation-1';
+  const planned = [
+    { tool: 'planner_list_todos', arguments: { status: 'pending' } },
+    { tool: 'planner_build_report', arguments: { todos } },
+    { tool: 'planner_validate_report', arguments: { reportId } },
+    { tool: 'planner_save_report', arguments: { validationId, fileName: 'todos.md' } },
+    { tool: null, arguments: {} }
+  ];
+  let planningStep = 0;
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const runtime = new McpAgentRuntime({
+    async listTools() {
+      return ['planner_list_todos', 'planner_build_report', 'planner_validate_report', 'planner_save_report'].map((name) => ({
+        name, description: name, inputSchema: { type: 'object' }
+      }));
+    },
+    async callTool(name, args) {
+      calls.push({ name, args });
+      if (name === 'planner_list_todos') return { content: [{ type: 'text', text: JSON.stringify({ todos }) }], structuredContent: { todos } };
+      if (name === 'planner_build_report') return { content: [{ type: 'text', text: JSON.stringify({ reportId }) }], structuredContent: { reportId } };
+      if (name === 'planner_validate_report') return { content: [{ type: 'text', text: JSON.stringify({ validationId, valid: true }) }], structuredContent: { validationId, valid: true } };
+      return { content: [{ type: 'text', text: JSON.stringify({ saved: true, path: '/tmp/todos.md', markdown: report.markdown, displayInAgent: true }) }] };
+    }
+  }, async (messages) => {
+    if (planningStep > 0) assert.match(messages.at(-1)?.content ?? '', /mcp_tool_result/);
+    return { answer: JSON.stringify(planned[planningStep++]) };
+  });
+
+  const resolved = await runtime.resolve('Составь отчёт по незавершённым задачам и сохрани его.');
+  assert.deepEqual(calls.map((call) => call.name), [
+    'planner_list_todos', 'planner_build_report', 'planner_validate_report', 'planner_save_report'
+  ]);
+  assert.deepEqual(calls[1].args.todos, todos);
+  assert.equal(calls[2].args.reportId, reportId);
+  assert.equal(calls[3].args.validationId, validationId);
+  assert.equal(resolved.calls.length, 4);
+  assert.match(resolved.contextMessages.at(-1)?.content ?? '', /автоматически покажет пользователю/);
+});

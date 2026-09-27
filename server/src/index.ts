@@ -390,6 +390,7 @@ const invariantsFilePath = path.join(agentDataPath, 'invariants.json');
 const mcpConnectionsFilePath = path.join(agentDataPath, 'mcp-connections.json');
 const googleCalendarTokenFilePath = path.join(agentDataPath, 'secrets', 'google-calendar-token.json');
 const plannerDatabasePath = path.join(agentDataPath, 'planner.sqlite');
+const plannerReportsPath = path.join(agentDataPath, 'reports');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 const invariantStore = new JsonInvariantStore(invariantsFilePath);
@@ -402,7 +403,7 @@ const googleCalendarAuth = new GoogleCalendarAuth(
 );
 const googleCalendarMcpServer = new GoogleCalendarMcpServer(googleCalendarAuth);
 const plannerStore = new PlannerStore(plannerDatabasePath);
-const plannerMcpServer = new PlannerMcpServer(plannerStore);
+const plannerMcpServer = new PlannerMcpServer(plannerStore, plannerReportsPath);
 const plannerScheduler = new PlannerScheduler(plannerStore);
 
 app.use(cors());
