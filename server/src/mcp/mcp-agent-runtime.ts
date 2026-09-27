@@ -13,6 +13,44 @@ export type McpToolClient = {
   callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult>;
 };
 
+export class CombinedMcpToolClient implements McpToolClient {
+  private readonly owners = new Map<string, McpToolClient>();
+
+  constructor(private readonly clients: McpToolClient[]) {}
+
+  async listTools(): Promise<McpToolDefinition[]> {
+    this.owners.clear();
+    const groups = await Promise.all(this.clients.map(async (client) => ({ client, tools: await client.listTools() })));
+    const tools: McpToolDefinition[] = [];
+    for (const group of groups) {
+      for (const tool of group.tools) {
+        if (this.owners.has(tool.name)) throw new Error(`Duplicate MCP tool name: ${tool.name}`);
+        this.owners.set(tool.name, group.client);
+        tools.push(tool);
+      }
+    }
+    return tools;
+  }
+
+  callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult> {
+    const owner = this.owners.get(name);
+    if (!owner) throw new Error(`Unknown MCP tool: ${name}`);
+    return owner.callTool(name, args);
+  }
+}
+
+export class ProfileScopedMcpToolClient implements McpToolClient {
+  constructor(private readonly client: McpToolClient, private readonly profileId: string) {}
+
+  listTools(): Promise<McpToolDefinition[]> {
+    return this.client.listTools();
+  }
+
+  callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult> {
+    return this.client.callTool(name, name.startsWith('planner_') ? { ...args, profileId: this.profileId } : args);
+  }
+}
+
 function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? text;
   const start = fenced.indexOf('{');
@@ -87,6 +125,12 @@ export class McpAgentRuntime implements AgentToolRuntime {
           'Ты выбираешь MCP-инструмент для запроса пользователя.',
           'Верни только JSON: {"tool": null, "arguments": {}} если инструмент не нужен,',
           'или {"tool": "точное имя", "arguments": {...}} если без внешних данных нельзя ответить достоверно.',
+          'Если пользователь просит сохранить, добавить или изменить данные и для этого есть инструмент, обязательно вызови его.',
+          'Нельзя утверждать, что данные сохранены, без фактического вызова write-инструмента.',
+          'Различай план и отчёт о результате: «нужно забрать заказ» — новое дело, «я забрал заказ» — завершение существующего дела.',
+          'Сообщение об уже выполненном действии всегда передавай в planner_complete_todos: сервер либо закроет точное активное дело, либо сам создаст выполненную запись для сводки.',
+          'Не проси пользователя подтвердить добавление выполненного дела и не предлагай оставить всё как есть.',
+          'Явные команды «удали», «очисти список» или «удали сводку» выполняй соответствующим delete-инструментом, не трактуй их как проект, требующий плана.',
           'Для относительных дат используй текущее время ниже и формируй RFC 3339.',
           `Текущее время: ${new Date().toISOString()}`,
           `Доступные инструменты: ${JSON.stringify(tools)}`

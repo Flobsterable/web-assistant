@@ -44,7 +44,10 @@ import {
 } from './token-meter.js';
 import { discoverMcpConnection, JsonMcpConnectionStore, McpConnectionError } from './mcp/mcp-connections.js';
 import { GoogleCalendarAuth, GoogleCalendarMcpServer } from './mcp/google-calendar-mcp.js';
-import { McpAgentRuntime, McpHttpClient } from './mcp/mcp-agent-runtime.js';
+import { CombinedMcpToolClient, McpAgentRuntime, McpHttpClient, ProfileScopedMcpToolClient } from './mcp/mcp-agent-runtime.js';
+import { PlannerStore } from './planner/planner-store.js';
+import { PlannerMcpServer } from './planner/planner-mcp.js';
+import { PlannerScheduler } from './planner/planner-scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -386,6 +389,7 @@ const tasksPath = path.join(agentDataPath, 'tasks');
 const invariantsFilePath = path.join(agentDataPath, 'invariants.json');
 const mcpConnectionsFilePath = path.join(agentDataPath, 'mcp-connections.json');
 const googleCalendarTokenFilePath = path.join(agentDataPath, 'secrets', 'google-calendar-token.json');
+const plannerDatabasePath = path.join(agentDataPath, 'planner.sqlite');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 const invariantStore = new JsonInvariantStore(invariantsFilePath);
@@ -397,6 +401,9 @@ const googleCalendarAuth = new GoogleCalendarAuth(
   readOptionalTextEnv('GOOGLE_CALENDAR_REDIRECT_URI') ?? `http://localhost:${port}/api/google-calendar/oauth/callback`
 );
 const googleCalendarMcpServer = new GoogleCalendarMcpServer(googleCalendarAuth);
+const plannerStore = new PlannerStore(plannerDatabasePath);
+const plannerMcpServer = new PlannerMcpServer(plannerStore);
+const plannerScheduler = new PlannerScheduler(plannerStore);
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
@@ -888,7 +895,13 @@ function createAgent(
     useLongTermMemory: memoryUsage?.longTerm ?? true,
     complete: (messages, options) => requestCompletion(agentModel, messages, options),
     toolRuntime: new McpAgentRuntime(
-      new McpHttpClient(`http://127.0.0.1:${port}/mcp/google-calendar`),
+      new ProfileScopedMcpToolClient(
+        new CombinedMcpToolClient([
+          new McpHttpClient(`http://127.0.0.1:${port}/mcp/google-calendar`),
+          new McpHttpClient(`http://127.0.0.1:${port}/mcp/planner`)
+        ]),
+        userProfile?.id ?? defaultProfileId
+      ),
       (messages, options) => requestCompletion(agentModel, messages, options)
     )
   });
@@ -907,6 +920,10 @@ app.get('/api/config', (_req: Request, res: Response) => {
 
 app.post('/mcp/google-calendar', async (req: Request, res: Response) => {
   await googleCalendarMcpServer.handleHttp(req, res);
+});
+
+app.post('/mcp/planner', async (req: Request, res: Response) => {
+  await plannerMcpServer.handleHttp(req, res);
 });
 
 app.get('/api/google-calendar/status', async (_req: Request, res: Response) => {
@@ -1179,6 +1196,24 @@ app.get('/api/tasks', async (req: Request, res: Response) => {
     return res.json({ profileId, tasks: await createTaskStateStore(profileId).list() });
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load tasks.' });
+  }
+});
+
+app.get('/api/planner/state', (req: Request, res: Response) => {
+  const profileId = readProfileIdFromRequest(req);
+  try {
+    return res.json({
+      profileId,
+      todos: plannerStore.listTodos(profileId),
+      summaries: {
+        daily: plannerStore.latestSummary(profileId, 'daily'),
+        weekly: plannerStore.latestSummary(profileId, 'weekly')
+      },
+      scheduler: plannerScheduler.status(),
+      server: { name: 'planner-mcp', version: '1.0.0', endpoint: '/mcp/planner', tools: plannerMcpServer.listTools() }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось загрузить планировщик.' });
   }
 });
 
@@ -1659,5 +1694,6 @@ app.post('/api/agent', async (req: Request, res: Response) => {
 });
 
 app.listen(port, () => {
+  plannerScheduler.start();
   console.log(`Server is running on http://localhost:${port}`);
 });

@@ -366,9 +366,13 @@ export class SimpleAgent {
       { temperature: this.temperature }
     );
 
-    const responseAssessment = await this.assess(normalizedRequest, invariants, completion.answer);
+    const performedPlannerAction = toolResolution.calls.some((call) => call.name.startsWith('planner_'));
+    const responseInvariants = performedPlannerAction
+      ? invariants.filter((invariant) => !invariant.id.startsWith('task-lifecycle-'))
+      : invariants;
+    const responseAssessment = await this.assess(normalizedRequest, responseInvariants, completion.answer);
     if (responseAssessment.status !== 'allowed') {
-      return this.persistRefusal(normalizedRequest, invariants, responseAssessment, preparedContext, initialTokenReport, 'response');
+      return this.persistRefusal(normalizedRequest, responseInvariants, responseAssessment, preparedContext, initialTokenReport, 'response');
     }
 
     await this.conversationStore.appendMany([
@@ -387,7 +391,7 @@ export class SimpleAgent {
       invariantCompliance: {
         ...responseAssessment,
         phase: null,
-        appliedIds: invariants.map((invariant) => invariant.id)
+        appliedIds: responseInvariants.map((invariant) => invariant.id)
       },
       tokenReport: createTokenReport({
         systemPrompt: this.systemPrompt,

@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { McpSettingsScreen } from './McpSettingsScreen';
+import { PlannerScreen } from './PlannerScreen';
 
 type AgentResponse = {
   answer: string;
@@ -478,7 +479,7 @@ export default function App() {
   const [invariantRule, setInvariantRule] = useState('');
   const [invariantRationale, setInvariantRationale] = useState('');
   const [isSavingInvariant, setIsSavingInvariant] = useState(false);
-  const [activeView, setActiveView] = useState<'chat' | 'mcp'>('chat');
+  const [activeView, setActiveView] = useState<'chat' | 'planner' | 'mcp'>('chat');
 
   const selectedModel = useMemo(
     () => config?.models.find((model) => model.id === selectedModelId) ?? config?.models[0],
@@ -1023,6 +1024,14 @@ export default function App() {
           <nav className="sidebar-extensions" aria-label="Расширения">
             <span className="sidebar-section-label">Расширения</span>
             <button
+              className={activeView === 'planner' ? 'active' : ''}
+              type="button"
+              onClick={() => setActiveView('planner')}
+            >
+              <span className="sidebar-extension-icon" aria-hidden="true">◷</span>
+              <span><strong>Планировщики</strong><small>Дела и фоновые сводки</small></span>
+            </button>
+            <button
               className={activeView === 'mcp' ? 'active' : ''}
               type="button"
               onClick={() => setActiveView('mcp')}
@@ -1033,9 +1042,11 @@ export default function App() {
           </nav>
         </aside>
 
-        <div className={`app-frame ${activeView === 'mcp' ? 'mcp-app-frame' : ''}`}>
+        <div className={`app-frame ${activeView !== 'chat' ? 'mcp-app-frame' : ''}`}>
           {activeView === 'mcp' ? (
             <McpSettingsScreen />
+          ) : activeView === 'planner' ? (
+            <PlannerScreen profileId={selectedProfileId} />
           ) : (
             <>
           <header className="chat-header">

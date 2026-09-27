@@ -139,3 +139,44 @@ test('lifecycle violation produces a controlled next-step response', () => {
   assert.match(answer, /План ещё не утверждён/u);
   assert.doesNotMatch(answer, /Могу помочь подобрать вариант/u);
 });
+
+test('a completed Planner action is not rejected by the task lifecycle invariant', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-lifecycle-'));
+  try {
+    const lifecycle = createTaskLifecycleInvariant('planning');
+    const invariantStore = { active: async () => [lifecycle] };
+    let checks = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore,
+      useWorkingMemory: false,
+      useLongTermMemory: false,
+      assessInvariantCompliance: async ({ candidateAnswer }) => {
+        checks += 1;
+        return candidateAnswer === undefined
+          ? { status: 'allowed', violations: [], explanation: 'Явная операция Planner разрешена.' }
+          : { status: 'conflict', violations: [{ id: lifecycle.id, reason: 'Ложный конфликт.' }], explanation: 'Ложный конфликт.' };
+      },
+      toolRuntime: {
+        resolve: async () => ({
+          contextMessages: [{ role: 'system', content: 'Список дел очищен.' }],
+          calls: [{ name: 'planner_delete_todos', arguments: { all: true }, result: '{"deletedCount":2}', isError: false }]
+        })
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Список дел очищен.')
+    });
+
+    const result = await agent.run('Очисти список дел');
+    assert.equal(checks, 1);
+    assert.equal(result.answer, 'Список дел очищен.');
+    assert.equal(result.finishReason, 'stop');
+    assert.deepEqual(result.invariantCompliance?.appliedIds, []);
+    assert.equal(result.toolCalls?.[0]?.name, 'planner_delete_todos');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
