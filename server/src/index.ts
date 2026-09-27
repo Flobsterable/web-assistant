@@ -42,6 +42,7 @@ import {
   estimateTokens,
   normalizeTokenBudget
 } from './token-meter.js';
+import { discoverMcpConnection, JsonMcpConnectionStore, McpConnectionError } from './mcp/mcp-connections.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -381,9 +382,11 @@ const profilesPath = path.join(agentDataPath, 'profiles');
 const agentLogsPath = path.join(agentDataPath, 'agent-logs');
 const tasksPath = path.join(agentDataPath, 'tasks');
 const invariantsFilePath = path.join(agentDataPath, 'invariants.json');
+const mcpConnectionsFilePath = path.join(agentDataPath, 'mcp-connections.json');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 const invariantStore = new JsonInvariantStore(invariantsFilePath);
+const mcpConnectionStore = new JsonMcpConnectionStore(mcpConnectionsFilePath);
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
@@ -886,6 +889,41 @@ app.get('/api/config', (_req: Request, res: Response) => {
     });
   }
   return res.json({ models: [], hasApiKey: false, error: 'Не настроен API-ключ ни для одной модели.' });
+});
+
+app.get('/api/mcp/connections', async (_req: Request, res: Response) => {
+  try {
+    return res.json({ connections: await mcpConnectionStore.list() });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось загрузить MCP-подключения.' });
+  }
+});
+
+app.post('/api/mcp/connections', async (req: Request, res: Response) => {
+  const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+  const endpoint = typeof body.endpoint === 'string' ? body.endpoint : '';
+  const headerName = typeof body.headerName === 'string' ? body.headerName : undefined;
+  const headerValue = typeof body.headerValue === 'string' ? body.headerValue : undefined;
+  try {
+    const discovered = await discoverMcpConnection({ endpoint, headerName, headerValue });
+    return res.status(201).json({ connection: await mcpConnectionStore.save(discovered) });
+  } catch (error) {
+    if (error instanceof McpConnectionError) {
+      return res.status(error.code === 'invalid_input' ? 400 : 502).json({ error: error.message });
+    }
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось подключить MCP server.' });
+  }
+});
+
+app.delete('/api/mcp/connections/:id', async (req: Request, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    return await mcpConnectionStore.remove(id)
+      ? res.status(204).send()
+      : res.status(404).json({ error: 'MCP connection not found.' });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось удалить MCP-подключение.' });
+  }
 });
 
 app.get('/api/agent/history', async (req: Request, res: Response) => {

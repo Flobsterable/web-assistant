@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { McpSettingsScreen } from './McpSettingsScreen';
 
 type AgentResponse = {
   answer: string;
@@ -470,6 +471,7 @@ export default function App() {
   const [invariantRule, setInvariantRule] = useState('');
   const [invariantRationale, setInvariantRationale] = useState('');
   const [isSavingInvariant, setIsSavingInvariant] = useState(false);
+  const [activeView, setActiveView] = useState<'chat' | 'mcp'>('chat');
 
   const selectedModel = useMemo(
     () => config?.models.find((model) => model.id === selectedModelId) ?? config?.models[0],
@@ -577,6 +579,7 @@ export default function App() {
   }, [sessionId, selectedProfileId]);
 
   function openChat(nextSessionId: string, options?: { replace?: boolean }) {
+    setActiveView('chat');
     const nextUrl = new URL(window.location.href);
     nextUrl.searchParams.set('sessionId', nextSessionId);
     if (options?.replace) {
@@ -972,7 +975,7 @@ export default function App() {
               <p className="chat-list-empty">Сохранённых чатов пока нет.</p>
             ) : (
               chats.map((chat) => (
-                <div className={`chat-list-item ${chat.sessionId === sessionId ? 'active' : ''}`} key={chat.sessionId}>
+                <div className={`chat-list-item ${activeView === 'chat' && chat.sessionId === sessionId ? 'active' : ''}`} key={chat.sessionId}>
                   <button className="chat-open-button" type="button" onClick={() => openChat(chat.sessionId)}>
                     <span>{chat.title}</span>
                     {chat.lastMessagePreview && <small>{chat.lastMessagePreview}</small>}
@@ -995,7 +998,7 @@ export default function App() {
                 <p className="chat-list-empty">Отложенных задач пока нет.</p>
               ) : tasks.map((task) => (
                 <button
-                  className={`sidebar-task-item ${task.activeSessionId === sessionId ? 'active' : ''}`}
+                  className={`sidebar-task-item ${activeView === 'chat' && task.activeSessionId === sessionId ? 'active' : ''}`}
                   type="button"
                   onClick={() => void handleOpenTask(task)}
                   key={task.id}
@@ -1009,9 +1012,25 @@ export default function App() {
               ))}
             </div>
           </section>
+
+          <nav className="sidebar-extensions" aria-label="Расширения">
+            <span className="sidebar-section-label">Расширения</span>
+            <button
+              className={activeView === 'mcp' ? 'active' : ''}
+              type="button"
+              onClick={() => setActiveView('mcp')}
+            >
+              <span className="sidebar-extension-icon" aria-hidden="true">◇</span>
+              <span><strong>MCP</strong><small>Connections & tools</small></span>
+            </button>
+          </nav>
         </aside>
 
-        <div className="app-frame">
+        <div className={`app-frame ${activeView === 'mcp' ? 'mcp-app-frame' : ''}`}>
+          {activeView === 'mcp' ? (
+            <McpSettingsScreen />
+          ) : (
+            <>
           <header className="chat-header">
             <div className="chat-heading">
               <strong>{session?.title ?? 'Новый чат'}</strong>
@@ -1345,7 +1364,8 @@ export default function App() {
             </button>
           </div>
         </form>
-
+            </>
+          )}
       </div>
       </div>
     </main>

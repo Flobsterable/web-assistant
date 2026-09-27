@@ -229,6 +229,17 @@ npm run dev
 Frontend будет доступен на `http://localhost:5173`.
 Backend будет доступен на `http://localhost:3001`.
 
+## MCP connections
+
+Экран `MCP` в секции `Расширения` подключает публичные Streamable HTTP
+MCP endpoints через официальный SDK `@modelcontextprotocol/client`. Клиент
+выполняет `initialize` и `tools/list`, но не вызывает инструменты.
+
+После успешного discovery имя, версия, endpoint и список tools сохраняются в
+`server/data/mcp-connections.json`. Значение авторизационного header не сохраняется.
+Нажатие на карточку сервиса открывает его инструменты; кнопка `Удалить MCP`
+удаляет подключение из реестра.
+
 ## Production-сборка
 
 ```bash
