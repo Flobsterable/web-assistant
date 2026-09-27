@@ -22,6 +22,12 @@ type AgentResponse = {
   memoryEvents?: MemoryEvent[];
   task?: TaskState | null;
   invariantCompliance?: InvariantCompliance;
+  toolCalls?: Array<{
+    name: string;
+    arguments: Record<string, unknown>;
+    result: string;
+    isError: boolean;
+  }>;
 };
 
 type AgentErrorResponse = {
@@ -405,6 +411,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
                 : 'не заданы'}
             </span>
             <span>Проверка: {message.meta.invariantCompliance?.status === 'allowed' ? 'соблюдены' : message.meta.invariantCompliance?.status ?? '—'}</span>
+            <span>MCP: {message.meta.toolCalls?.length ? message.meta.toolCalls.map((call) => `${call.name}${call.isError ? ' (ошибка)' : ''}`).join(', ') : 'не вызывался'}</span>
             <span>Рабочая: {message.meta.contextManagement.memory.workingEnabled ? 'включена' : 'выключена'}</span>
             <span>Долговременная: {message.meta.contextManagement.memory.longTermEnabled ? 'включена' : 'выключена'}</span>
             <span>Стоимость: {formatCost(message.meta.cost, message.meta.priceCurrency)}</span>

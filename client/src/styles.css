@@ -454,6 +454,14 @@ select {
 
 .mcp-connection-card,
 .mcp-tools-card { padding: 19px; }
+.mcp-calendar-card { border-color: #b9d0ee; }
+.mcp-calendar-meta { display: grid; gap: 9px; margin: 16px 0; }
+.mcp-calendar-meta div { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; }
+.mcp-calendar-meta dt { color: #87949c; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.mcp-calendar-meta dd { margin: 0; color: #52636e; overflow-wrap: anywhere; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mcp-calendar-actions { display: flex; justify-content: flex-end; margin: 15px 0; }
+.mcp-calendar-actions > button:not(.mcp-disconnect-button) { min-height: 36px; border: 0; border-radius: 7px; padding: 0 14px; color: #fff; background: #2d806f; cursor: pointer; font-size: 11px; font-weight: 800; }
+.mcp-calendar-actions > button:disabled { cursor: not-allowed; opacity: .55; }
 .mcp-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 17px; }
 .mcp-card-heading h2,
 .mcp-server-summary h2,

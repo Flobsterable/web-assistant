@@ -10,6 +10,15 @@ type McpConnection = {
   updatedAt: string;
 };
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'error';
+type GoogleCalendarStatus = {
+  configured: boolean;
+  connected: boolean;
+  scope: string | null;
+  redirectUri: string;
+  endpoint: string;
+  server: { name: string; version: string };
+  tools: McpTool[];
+};
 
 const stateCopy: Record<ConnectionState, string> = {
   idle: 'Нет подключений',
@@ -37,6 +46,8 @@ export function McpSettingsScreen() {
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [calendarStatus, setCalendarStatus] = useState<GoogleCalendarStatus | null>(null);
+  const [calendarBusy, setCalendarBusy] = useState(false);
 
   const selectedConnection = useMemo(
     () => connections.find((connection) => connection.id === selectedId) ?? null,
@@ -64,6 +75,71 @@ export function McpSettingsScreen() {
     void loadConnections();
     return () => controller.abort();
   }, []);
+
+  async function loadCalendarStatus() {
+    const response = await fetch('/api/google-calendar/status');
+    const data = (await response.json()) as GoogleCalendarStatus & { error?: string };
+    if (!response.ok) throw new Error(data.error ?? 'Не удалось проверить Google Calendar.');
+    setCalendarStatus(data);
+    return data;
+  }
+
+  useEffect(() => {
+    void loadCalendarStatus().catch((caughtError) => {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось проверить Google Calendar.');
+    });
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin === window.location.origin && event.data?.type === 'google-calendar-connected') {
+        void loadCalendarStatus();
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+
+  async function connectCalendar() {
+    if (!calendarStatus?.configured) return;
+    setCalendarBusy(true);
+    setError(null);
+    const popup = window.open('/api/google-calendar/oauth/start', 'google-calendar-oauth', 'popup,width=560,height=720');
+    if (!popup) {
+      setCalendarBusy(false);
+      setError('Браузер заблокировал OAuth-окно. Разрешите всплывающие окна для этого сайта.');
+      return;
+    }
+    const deadline = Date.now() + 2 * 60_000;
+    const interval = window.setInterval(() => {
+      void loadCalendarStatus().then((status) => {
+        if (status.connected || Date.now() >= deadline || popup.closed) {
+          window.clearInterval(interval);
+          setCalendarBusy(false);
+          if (status.connected && !popup.closed) popup.close();
+        }
+      }).catch(() => {
+        if (Date.now() >= deadline || popup.closed) {
+          window.clearInterval(interval);
+          setCalendarBusy(false);
+        }
+      });
+    }, 1000);
+  }
+
+  async function disconnectCalendar() {
+    setCalendarBusy(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/google-calendar/oauth', { method: 'DELETE' });
+      if (!response.ok) {
+        const data = (await response.json()) as { error?: string };
+        throw new Error(data.error ?? 'Не удалось отключить Google Calendar.');
+      }
+      await loadCalendarStatus();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось отключить Google Calendar.');
+    } finally {
+      setCalendarBusy(false);
+    }
+  }
 
   async function connect(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -134,13 +210,32 @@ export function McpSettingsScreen() {
     <section className="mcp-settings-screen" aria-labelledby="mcp-settings-title">
       <header className="mcp-settings-header">
         <div><p className="mcp-kicker">Настройки системы</p><h1 id="mcp-settings-title">MCP connections</h1><p>Подключите публичный MCP server и просмотрите доступные инструменты.</p></div>
-        <div className="mcp-header-status"><span className="mcp-active-status"><i aria-hidden="true" /> Интеграция активна</span><span className="mcp-discovery-badge">Discovery only</span></div>
+        <div className="mcp-header-status"><span className="mcp-active-status"><i aria-hidden="true" /> Интеграция активна</span><span className="mcp-discovery-badge">Tools enabled</span></div>
       </header>
 
       <div className="mcp-settings-content">
         <article className="mcp-security-notice">
           <div className="mcp-security-icon" aria-hidden="true">✓</div>
-          <div><strong>Только чтение</strong><span className="mcp-security-required">HTTPS REQUIRED</span><p>Мы выполняем только initialize и tools/list. Header value и tools/call не сохраняются.</p></div>
+          <div><strong>Безопасный режим</strong><span className="mcp-security-required">READ ONLY CALENDAR</span><p>Встроенный календарный инструмент вызывает tools/call только с OAuth scope calendar.readonly. Для внешних HTTPS-серверов пока доступен discovery.</p></div>
+        </article>
+
+        <article className="mcp-connection-card mcp-calendar-card">
+          <div className="mcp-card-heading">
+            <div><p className="mcp-kicker">Встроенный MCP server</p><h2>Google Calendar</h2><p>Read-only доступ к расписанию через OAuth 2.0.</p></div>
+            <span className={`mcp-state-pill mcp-state-${calendarStatus?.connected ? 'connected' : calendarStatus === null || calendarStatus.configured ? 'idle' : 'error'}`}><i aria-hidden="true" /> {calendarStatus?.connected ? 'Авторизован' : calendarStatus === null ? 'Загрузка…' : calendarStatus.configured ? 'Готов к OAuth' : 'Нужны credentials'}</span>
+          </div>
+          <dl className="mcp-calendar-meta">
+            <div><dt>MCP endpoint</dt><dd>{calendarStatus?.endpoint ?? '/mcp/google-calendar'}</dd></div>
+            <div><dt>OAuth redirect URI</dt><dd>{calendarStatus?.redirectUri ?? 'Загрузка…'}</dd></div>
+            <div><dt>Scope</dt><dd>calendar.readonly</dd></div>
+          </dl>
+          {!calendarStatus?.configured && <div className="mcp-error-state" role="status"><div className="mcp-error-icon" aria-hidden="true">!</div><div><strong>Добавьте Google OAuth credentials</strong><p>Укажите GOOGLE_CALENDAR_CLIENT_ID и GOOGLE_CALENDAR_CLIENT_SECRET в .env, затем перезапустите backend.</p></div></div>}
+          <div className="mcp-calendar-actions">
+            {calendarStatus?.connected
+              ? <button type="button" className="mcp-disconnect-button" disabled={calendarBusy} onClick={() => void disconnectCalendar()}>{calendarBusy ? 'Отключение…' : 'Отключить Google Calendar'}</button>
+              : <button type="button" disabled={calendarBusy || !calendarStatus?.configured} onClick={() => void connectCalendar()}>{calendarBusy ? 'Ожидание OAuth…' : 'Войти через Google'}</button>}
+          </div>
+          {calendarStatus?.tools.map((tool) => <details className="mcp-tool-item" key={tool.name}><summary><span className="mcp-tool-item-icon" aria-hidden="true">⌁</span><span><strong>{tool.name}</strong><small>{tool.description}</small></span></summary><pre>{JSON.stringify(tool.inputSchema, null, 2)}</pre></details>)}
         </article>
 
         <article className="mcp-connection-card">

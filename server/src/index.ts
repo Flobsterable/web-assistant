@@ -43,6 +43,8 @@ import {
   normalizeTokenBudget
 } from './token-meter.js';
 import { discoverMcpConnection, JsonMcpConnectionStore, McpConnectionError } from './mcp/mcp-connections.js';
+import { GoogleCalendarAuth, GoogleCalendarMcpServer } from './mcp/google-calendar-mcp.js';
+import { McpAgentRuntime, McpHttpClient } from './mcp/mcp-agent-runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -383,10 +385,18 @@ const agentLogsPath = path.join(agentDataPath, 'agent-logs');
 const tasksPath = path.join(agentDataPath, 'tasks');
 const invariantsFilePath = path.join(agentDataPath, 'invariants.json');
 const mcpConnectionsFilePath = path.join(agentDataPath, 'mcp-connections.json');
+const googleCalendarTokenFilePath = path.join(agentDataPath, 'secrets', 'google-calendar-token.json');
 const defaultProfileId = 'default';
 const defaultAgentSessionId = 'main';
 const invariantStore = new JsonInvariantStore(invariantsFilePath);
 const mcpConnectionStore = new JsonMcpConnectionStore(mcpConnectionsFilePath);
+const googleCalendarAuth = new GoogleCalendarAuth(
+  googleCalendarTokenFilePath,
+  readOptionalTextEnv('GOOGLE_CALENDAR_CLIENT_ID'),
+  readOptionalTextEnv('GOOGLE_CALENDAR_CLIENT_SECRET'),
+  readOptionalTextEnv('GOOGLE_CALENDAR_REDIRECT_URI') ?? `http://localhost:${port}/api/google-calendar/oauth/callback`
+);
+const googleCalendarMcpServer = new GoogleCalendarMcpServer(googleCalendarAuth);
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
@@ -876,7 +886,11 @@ function createAgent(
     keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
     useWorkingMemory: memoryUsage?.working ?? true,
     useLongTermMemory: memoryUsage?.longTerm ?? true,
-    complete: (messages, options) => requestCompletion(agentModel, messages, options)
+    complete: (messages, options) => requestCompletion(agentModel, messages, options),
+    toolRuntime: new McpAgentRuntime(
+      new McpHttpClient(`http://127.0.0.1:${port}/mcp/google-calendar`),
+      (messages, options) => requestCompletion(agentModel, messages, options)
+    )
   });
 }
 
@@ -889,6 +903,55 @@ app.get('/api/config', (_req: Request, res: Response) => {
     });
   }
   return res.json({ models: [], hasApiKey: false, error: 'Не настроен API-ключ ни для одной модели.' });
+});
+
+app.post('/mcp/google-calendar', async (req: Request, res: Response) => {
+  await googleCalendarMcpServer.handleHttp(req, res);
+});
+
+app.get('/api/google-calendar/status', async (_req: Request, res: Response) => {
+  try {
+    return res.json({
+      ...(await googleCalendarAuth.status()),
+      server: { name: 'google-calendar-mcp', version: '1.0.0' },
+      endpoint: '/mcp/google-calendar',
+      tools: googleCalendarMcpServer.listTools()
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось проверить Google Calendar.' });
+  }
+});
+
+app.get('/api/google-calendar/oauth/start', (_req: Request, res: Response) => {
+  try {
+    return res.redirect(googleCalendarAuth.createAuthorizationUrl());
+  } catch (error) {
+    return res.status(400).send(error instanceof Error ? error.message : 'Google OAuth не настроен.');
+  }
+});
+
+app.get('/api/google-calendar/oauth/callback', async (req: Request, res: Response) => {
+  const code = typeof req.query.code === 'string' ? req.query.code : '';
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  const oauthError = typeof req.query.error === 'string' ? req.query.error : '';
+  try {
+    if (oauthError) throw new Error(`Google OAuth: ${oauthError}`);
+    if (!code || !state) throw new Error('Google не вернул code или state.');
+    await googleCalendarAuth.exchangeAuthorizationCode(code, state);
+    return res.type('html').send('<!doctype html><meta charset="utf-8"><title>Google Calendar подключён</title><style>body{font:16px system-ui;max-width:620px;margin:80px auto;padding:24px;color:#162032}h1{color:#16784b}</style><h1>Google Calendar подключён</h1><p>Можно закрыть эту вкладку и вернуться к агенту.</p><script>window.opener?.postMessage({type:"google-calendar-connected"}, location.origin)</script>');
+  } catch (error) {
+    const message = (error instanceof Error ? error.message : 'Ошибка Google OAuth.').replace(/[<>&"]/g, (character) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[character] ?? character);
+    return res.status(400).type('html').send(`<!doctype html><meta charset="utf-8"><title>Ошибка OAuth</title><style>body{font:16px system-ui;max-width:620px;margin:80px auto;padding:24px;color:#162032}h1{color:#b3261e}</style><h1>Не удалось подключить Google Calendar</h1><p>${message}</p>`);
+  }
+});
+
+app.delete('/api/google-calendar/oauth', async (_req: Request, res: Response) => {
+  try {
+    await googleCalendarAuth.disconnect();
+    return res.status(204).send();
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Не удалось отключить Google Calendar.' });
+  }
 });
 
 app.get('/api/mcp/connections', async (_req: Request, res: Response) => {

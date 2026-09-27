@@ -17,6 +17,17 @@ export type AgentMessage = {
   content: string;
 };
 
+export type AgentToolCall = {
+  name: string;
+  arguments: Record<string, unknown>;
+  result: string;
+  isError: boolean;
+};
+
+export type AgentToolRuntime = {
+  resolve(userRequest: string): Promise<{ contextMessages: AgentMessage[]; calls: AgentToolCall[] }>;
+};
+
 export type StoredAgentMessage = {
   id: string;
   role: 'user' | 'assistant';
@@ -85,6 +96,7 @@ export type AgentRunResult = AgentCompletionResult & {
   agentProvider: string;
   modelTitle: string;
   model: string;
+  toolCalls?: AgentToolCall[];
 };
 
 export class AgentContextOverflowError extends Error {
@@ -129,6 +141,7 @@ type SimpleAgentOptions = {
     userRequest: string;
     candidateAnswer?: string;
   }) => Promise<InvariantAssessment>;
+  toolRuntime?: AgentToolRuntime;
 };
 
 type PersistedConversation = {
@@ -265,6 +278,7 @@ export class SimpleAgent {
   private readonly userProfile: UserProfile;
   private readonly invariantStore?: { active: () => Promise<Invariant[]> };
   private readonly assessInvariants?: SimpleAgentOptions['assessInvariantCompliance'];
+  private readonly toolRuntime?: AgentToolRuntime;
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -286,6 +300,7 @@ export class SimpleAgent {
     this.userProfile = options.userProfile ?? defaultUserProfile;
     this.invariantStore = options.invariantStore;
     this.assessInvariants = options.assessInvariantCompliance;
+    this.toolRuntime = options.toolRuntime;
   }
 
   async history() {
@@ -334,6 +349,7 @@ export class SimpleAgent {
       return this.persistRefusal(normalizedRequest, invariants, requestAssessment, preparedContext, initialTokenReport, 'request');
     }
 
+    const toolResolution = await this.toolRuntime?.resolve(normalizedRequest) ?? { contextMessages: [], calls: [] };
     const completion = await this.complete(
       [
         {
@@ -341,6 +357,7 @@ export class SimpleAgent {
           content: this.systemPrompt
         },
         ...preparedContext.messages,
+        ...toolResolution.contextMessages,
         {
           role: 'user',
           content: normalizedRequest
@@ -389,7 +406,8 @@ export class SimpleAgent {
       agentName: this.name,
       agentProvider: this.provider,
       modelTitle: this.modelTitle,
-      model: this.model
+      model: this.model,
+      ...(toolResolution.calls.length > 0 ? { toolCalls: toolResolution.calls } : {})
     };
   }
 

@@ -231,9 +231,66 @@ Backend будет доступен на `http://localhost:3001`.
 
 ## MCP connections
 
-Экран `MCP` в секции `Расширения` подключает публичные Streamable HTTP
-MCP endpoints через официальный SDK `@modelcontextprotocol/client`. Клиент
-выполняет `initialize` и `tools/list`, но не вызывает инструменты.
+В приложение встроен MCP-сервер `Google Calendar` со Streamable HTTP-подобным
+JSON-RPC endpoint:
+
+```text
+POST http://localhost:3001/mcp/google-calendar
+```
+
+Он регистрирует инструмент `google_calendar_list_events`, публикует его через
+`tools/list` и выполняет через `tools/call`. Входная схема инструмента содержит
+`calendarId`, `timeMin`, `timeMax`, `query` и `maxResults`. Результат —
+нормализованный JSON со списком событий, временной зоной и границами периода.
+
+Агент подключён к этому endpoint как MCP-клиент. Перед основным ответом модель
+решает, нужен ли календарь, затем клиент выполняет последовательность
+`initialize → notifications/initialized → tools/list → tools/call`. Результат
+возвращается модели в отдельном защищённом блоке данных. Фактический вызов виден
+в `Технические детали → MCP` под ответом агента.
+
+### Настройка Google OAuth
+
+1. В [Google Cloud Console](https://console.cloud.google.com/) создайте проект и
+   включите Google Calendar API.
+2. Настройте OAuth consent screen. Для тестового External-приложения добавьте
+   свой Google-аккаунт в Test users.
+3. Создайте OAuth Client ID типа **Web application**.
+4. Добавьте Authorized redirect URI:
+
+   ```text
+   http://localhost:3001/api/google-calendar/oauth/callback
+   ```
+
+5. Заполните `.env`:
+
+   ```text
+   GOOGLE_CALENDAR_CLIENT_ID=...
+   GOOGLE_CALENDAR_CLIENT_SECRET=...
+   GOOGLE_CALENDAR_REDIRECT_URI=http://localhost:3001/api/google-calendar/oauth/callback
+   ```
+
+6. Перезапустите `npm run dev`, откройте `Расширения → MCP` и нажмите
+   `Войти через Google`.
+
+Запрашивается только scope `calendar.readonly`: сервер не может создавать,
+изменять или удалять события. OAuth token хранится в
+`server/data/secrets/google-calendar-token.json` с правами `0600`; весь каталог
+`server/data` исключён из Git. Кнопка отключения отзывает token в Google и
+удаляет локальный файл.
+
+Проверка в чате:
+
+```text
+Какие встречи у меня в календаре на ближайшие 7 дней?
+```
+
+Если аккаунт не подключён, MCP всё равно вернёт корректный tool result с
+`isError: true`, а агент предложит пройти OAuth.
+
+Экран также подключает произвольные публичные Streamable HTTP MCP endpoints
+через официальный SDK `@modelcontextprotocol/client`. Для таких внешних
+подключений пока выполняются только `initialize` и `tools/list`.
 
 После успешного discovery имя, версия, endpoint и список tools сохраняются в
 `server/data/mcp-connections.json`. Значение авторизационного header не сохраняется.
