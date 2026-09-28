@@ -216,18 +216,18 @@ export function McpSettingsScreen() {
       <div className="mcp-settings-content">
         <article className="mcp-security-notice">
           <div className="mcp-security-icon" aria-hidden="true">✓</div>
-          <div><strong>Безопасный режим</strong><span className="mcp-security-required">READ ONLY CALENDAR</span><p>Встроенный календарный инструмент вызывает tools/call только с OAuth scope calendar.readonly. Для внешних HTTPS-серверов пока доступен discovery.</p></div>
+          <div><strong>Контролируемый доступ</strong><span className="mcp-security-required">CALENDAR EVENTS</span><p>Встроенный MCP читает расписание, создаёт и удаляет события с OAuth scope calendar.events. Для внешних HTTPS-серверов пока доступен discovery.</p></div>
         </article>
 
         <article className="mcp-connection-card mcp-calendar-card">
           <div className="mcp-card-heading">
-            <div><p className="mcp-kicker">Встроенный MCP server</p><h2>Google Calendar</h2><p>Read-only доступ к расписанию через OAuth 2.0.</p></div>
+            <div><p className="mcp-kicker">Встроенный MCP server</p><h2>Google Calendar</h2><p>Чтение расписания, создание и удаление встреч через OAuth 2.0.</p></div>
             <span className={`mcp-state-pill mcp-state-${calendarStatus?.connected ? 'connected' : calendarStatus === null || calendarStatus.configured ? 'idle' : 'error'}`}><i aria-hidden="true" /> {calendarStatus?.connected ? 'Авторизован' : calendarStatus === null ? 'Загрузка…' : calendarStatus.configured ? 'Готов к OAuth' : 'Нужны credentials'}</span>
           </div>
           <dl className="mcp-calendar-meta">
             <div><dt>MCP endpoint</dt><dd>{calendarStatus?.endpoint ?? '/mcp/google-calendar'}</dd></div>
             <div><dt>OAuth redirect URI</dt><dd>{calendarStatus?.redirectUri ?? 'Загрузка…'}</dd></div>
-            <div><dt>Scope</dt><dd>calendar.readonly</dd></div>
+            <div><dt>Scope</dt><dd>{calendarStatus?.scope?.replace('https://www.googleapis.com/auth/', '') ?? 'calendar.events'}</dd></div>
           </dl>
           {!calendarStatus?.configured && <div className="mcp-error-state" role="status"><div className="mcp-error-icon" aria-hidden="true">!</div><div><strong>Добавьте Google OAuth credentials</strong><p>Укажите GOOGLE_CALENDAR_CLIENT_ID и GOOGLE_CALENDAR_CLIENT_SECRET в .env, затем перезапустите backend.</p></div></div>}
           <div className="mcp-calendar-actions">

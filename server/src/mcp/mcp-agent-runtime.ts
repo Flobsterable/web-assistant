@@ -8,6 +8,28 @@ type JsonRpcResponse<T> = {
   error?: { code?: number; message?: string };
 };
 
+const DEFAULT_USER_TIME_ZONE = process.env.PLANNER_TIMEZONE?.trim() || 'Asia/Omsk';
+
+export function formatZonedDateTime(date: Date, timeZone = DEFAULT_USER_TIME_ZONE): string {
+  const parts = new Map(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  const year = Number(parts.get('year'));
+  const month = Number(parts.get('month'));
+  const day = Number(parts.get('day'));
+  const hour = Number(parts.get('hour'));
+  const minute = Number(parts.get('minute'));
+  const second = Number(parts.get('second'));
+  const representedAsUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+  const offsetMinutes = Math.round((representedAsUtc - Math.floor(date.getTime() / 1_000) * 1_000) / 60_000);
+  const sign = offsetMinutes < 0 ? '-' : '+';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offset = `${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, '0')}:${String(absoluteOffset % 60).padStart(2, '0')}`;
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}${offset}`;
+}
+
 export type McpToolClient = {
   listTools(): Promise<McpToolDefinition[]>;
   callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult>;
@@ -113,7 +135,8 @@ export class McpAgentRuntime implements AgentToolRuntime {
   constructor(
     private readonly client: McpToolClient,
     private readonly complete: CompleteText,
-    private readonly maxToolCalls = 6
+    private readonly maxToolCalls = 6,
+    private readonly userTimeZone = DEFAULT_USER_TIME_ZONE
   ) {}
 
   async resolve(userRequest: string): Promise<{ contextMessages: AgentMessage[]; calls: AgentToolCall[] }> {
@@ -131,13 +154,24 @@ export class McpAgentRuntime implements AgentToolRuntime {
           'Не повторяй уже выполненный вызов с теми же аргументами.',
           'Если пользователь просит сохранить, добавить или изменить данные и для этого есть инструмент, обязательно вызови его.',
           'Нельзя утверждать, что данные сохранены, без фактического вызова write-инструмента.',
-          'Для сохраняемого отчёта используй полную цепочку planner_list_todos → planner_build_report → planner_validate_report → planner_save_report.',
+          'Встреча — единый объект календаря и списка дел. Если пользователь просит запланировать встречу, сначала вызови google_calendar_create_event, а после успешного результата обязательно вызови planner_save_todos.',
+          'Для связанного дела используй название встречи и dueAt строго из event.start. Первой строкой description запиши точно "Google Calendar event: <event.id>", следующей строкой event.url, если он есть. Это обязательный ключ синхронизации. Не создавай дело, если календарь вернул ошибку.',
+          'Не вызывай google_calendar_create_event для обычной задачи без времени встречи: сохрани её только через planner_save_todos.',
+          'При явной просьбе удалить встречу выполни цепочку: google_calendar_list_events → google_calendar_delete_event → planner_list_todos → planner_delete_todos.',
+          'Передавай в google_calendar_delete_event только точный event.id из результата поиска. Удаляй, только если запрос однозначно соответствует одному событию; иначе не удаляй и попроси пользователя уточнить.',
+          'После успешного удаления события найди связанное дело: его description содержит точный event.id. Передай точный todo.id в planner_delete_todos.ids. Если связанного дела нет, не удаляй другие дела по похожему названию.',
+          'Дневные и недельные сводки planner_get_summaries уже объединяют дела и встречи Google Calendar; не дублируй события отдельным вызовом, если пользователь просит именно готовую сводку.',
+          'Для дневного или недельного сохраняемого отчёта используй полную цепочку planner_list_todos → google_calendar_list_events за тот же местный период → planner_build_report → planner_validate_report → planner_save_report.',
+          'В planner_build_report передавай без изменений и todos из Planner, и calendarEvents из поля events результата Google Calendar. Встречи, созданные вручную в Google Calendar, обязательны в отчёте.',
           'Различай план и отчёт о результате: «нужно забрать заказ» — новое дело, «я забрал заказ» — завершение существующего дела.',
           'Сообщение об уже выполненном действии всегда передавай в planner_complete_todos: сервер либо закроет точное активное дело, либо сам создаст выполненную запись для сводки.',
           'Не проси пользователя подтвердить добавление выполненного дела и не предлагай оставить всё как есть.',
           'Явные команды «удали», «очисти список» или «удали сводку» выполняй соответствующим delete-инструментом, не трактуй их как проект, требующий плана.',
-          'Для относительных дат используй текущее время ниже и формируй RFC 3339.',
-          `Текущее время: ${new Date().toISOString()}`,
+          `Часовой пояс пользователя: ${this.userTimeZone}. Любое время без явно указанного пояса трактуй как местное время пользователя, а не UTC.`,
+          'Для календарных инструментов передавай start/end в RFC 3339 с правильным локальным UTC offset и всегда передавай timeZone пользователя.',
+          'Например, 14:00 при Asia/Omsk нужно передать как 14:00:00+06:00 с timeZone="Asia/Omsk", а не как 14:00:00Z.',
+          'Для относительных дат используй текущее локальное время ниже.',
+          `Текущее локальное время: ${formatZonedDateTime(new Date(), this.userTimeZone)} [${this.userTimeZone}]`,
           `Доступные инструменты: ${JSON.stringify(tools)}`
         ].join('\n')
       },

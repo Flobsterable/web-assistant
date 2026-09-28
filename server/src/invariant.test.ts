@@ -190,6 +190,59 @@ test('a direct Planner report action bypasses the task lifecycle invariant at th
   }
 });
 
+test('an atomic calendar meeting flow bypasses the long-running task lifecycle invariant', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-calendar-lifecycle-'));
+  try {
+    const lifecycle = createTaskLifecycleInvariant('planning');
+    let lifecycleChecks = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore: { active: async () => [lifecycle] },
+      useWorkingMemory: false,
+      useLongTermMemory: false,
+      assessInvariantCompliance: async () => {
+        lifecycleChecks += 1;
+        return { status: 'conflict', violations: [{ id: lifecycle.id, reason: 'Ложный конфликт.' }], explanation: 'Ложный конфликт.' };
+      },
+      toolRuntime: {
+        resolve: async () => ({
+          contextMessages: [{ role: 'system', content: 'Встреча и связанное дело созданы.' }],
+          calls: [
+            {
+              name: 'google_calendar_create_event',
+              arguments: { summary: 'Ремонт', start: '2026-10-01T08:00:00.000Z', end: '2026-10-01T09:00:00.000Z' },
+              isError: false,
+              result: JSON.stringify({ created: true, event: { id: 'event-1', start: '2026-10-01T08:00:00.000Z' } })
+            },
+            {
+              name: 'planner_save_todos',
+              arguments: { todos: [{ title: 'Ремонт', dueAt: '2026-10-01T08:00:00.000Z' }] },
+              isError: false,
+              result: JSON.stringify({ count: 1 })
+            }
+          ]
+        })
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Встреча по ремонту создана в календаре и добавлена в дела.')
+    });
+
+    const result = await agent.run('Так, будет встреча в четверг с 2 до 3 по поводу ремонта.');
+    assert.equal(lifecycleChecks, 0);
+    assert.equal(result.finishReason, 'stop');
+    assert.deepEqual(result.toolCalls?.map((call) => call.name), [
+      'google_calendar_create_event', 'planner_save_todos'
+    ]);
+    assert.deepEqual(result.invariantCompliance?.appliedIds, []);
+    assert.match(result.answer, /создана в календаре/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('regular invariants are checked before a Planner write is executed', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-business-rule-'));
   try {

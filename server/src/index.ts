@@ -404,7 +404,10 @@ const googleCalendarAuth = new GoogleCalendarAuth(
 const googleCalendarMcpServer = new GoogleCalendarMcpServer(googleCalendarAuth);
 const plannerStore = new PlannerStore(plannerDatabasePath);
 const plannerMcpServer = new PlannerMcpServer(plannerStore, plannerReportsPath);
-const plannerScheduler = new PlannerScheduler(plannerStore);
+const plannerScheduler = new PlannerScheduler(plannerStore, {
+  async listTools() { return googleCalendarMcpServer.listTools(); },
+  async callTool(name, args) { return googleCalendarMcpServer.callTool(name, args); }
+});
 
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));

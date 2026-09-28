@@ -373,8 +373,10 @@ export class SimpleAgent {
     }
 
     const toolResolution = await this.toolRuntime?.resolve(normalizedRequest) ?? { contextMessages: [], calls: [] };
-    const performedPlannerAction = toolResolution.calls.some((call) => call.name.startsWith('planner_'));
-    if (!performedPlannerAction && lifecycleInvariants.length > 0) {
+    const performedDirectPersonalAction = toolResolution.calls.some((call) =>
+      call.name.startsWith('planner_') || call.name.startsWith('google_calendar_')
+    );
+    if (!performedDirectPersonalAction && lifecycleInvariants.length > 0) {
       const lifecycleRequestAssessment = await this.assess(normalizedRequest, lifecycleInvariants);
       if (lifecycleRequestAssessment.status !== 'allowed') {
         return this.persistRefusal(normalizedRequest, lifecycleInvariants, lifecycleRequestAssessment, preparedContext, initialTokenReport, 'request');
@@ -397,7 +399,7 @@ export class SimpleAgent {
     );
     const answer = withSavedReport(completion.answer, toolResolution.calls);
 
-    const responseInvariants = performedPlannerAction
+    const responseInvariants = performedDirectPersonalAction
       ? regularInvariants
       : invariants;
     const responseAssessment = await this.assess(normalizedRequest, responseInvariants, answer);

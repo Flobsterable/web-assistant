@@ -28,6 +28,16 @@ export type PlannerSummaryMetrics = {
   overdue: number;
   completionRate: number;
   byPriority: Record<PlannerPriority, number>;
+  meetings: number;
+};
+
+export type PlannerCalendarEvent = {
+  id: string | null;
+  summary: string;
+  start: string | null;
+  end: string | null;
+  location?: string | null;
+  url?: string | null;
 };
 
 export type PlannerSummary = {
@@ -72,7 +82,7 @@ function zonedDateToUtc(year: number, month: number, day: number, timezone = PLA
   return new Date(guess);
 }
 
-function calendarPeriod(kind: PlannerSummaryKind, now: Date) {
+export function plannerSummaryPeriod(kind: PlannerSummaryKind, now: Date) {
   const local = zonedParts(now);
   const daysFromMonday = (local.weekday + 6) % 7;
   const startDate = new Date(Date.UTC(local.year, local.month - 1, local.day - (kind === 'weekly' ? daysFromMonday : 0)));
@@ -85,6 +95,18 @@ function calendarPeriod(kind: PlannerSummaryKind, now: Date) {
     start: zonedDateToUtc(startDate.getUTCFullYear(), startDate.getUTCMonth() + 1, startDate.getUTCDate()),
     limit: zonedDateToUtc(limitDate.getUTCFullYear(), limitDate.getUTCMonth() + 1, limitDate.getUTCDate())
   };
+}
+
+function meetingList(events: PlannerCalendarEvent[], empty: string): string {
+  if (events.length === 0) return empty;
+  const formatter = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: PLANNER_TIMEZONE, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+  });
+  return events.slice(0, 12).map((event) => {
+    const when = event.start && !Number.isNaN(Date.parse(event.start)) ? formatter.format(new Date(event.start)) : 'время не указано';
+    const where = event.location ? ` · ${event.location}` : '';
+    return `• ${when} — ${event.summary}${where}`;
+  }).join('\n');
 }
 
 function uniqueTodos(...groups: PlannerTodo[][]): PlannerTodo[] {
@@ -138,6 +160,10 @@ function stringValue(value: unknown): string {
 
 function nullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : stringValue(value);
+}
+
+function calendarEventMarker(eventId: string): string {
+  return `Google Calendar event: ${eventId}`;
 }
 
 function parseTags(value: unknown): string[] {
@@ -265,6 +291,51 @@ export class PlannerStore {
     return rows.map((row) => toTodo(row as TodoRow));
   }
 
+  syncCalendarEvents(profileId: string, events: PlannerCalendarEvent[]): {
+    created: PlannerTodo[];
+    updated: PlannerTodo[];
+    unchanged: PlannerTodo[];
+    skippedWithoutId: number;
+  } {
+    const created: PlannerTodo[] = [];
+    const updated: PlannerTodo[] = [];
+    const unchanged: PlannerTodo[] = [];
+    let skippedWithoutId = 0;
+    for (const event of events) {
+      if (!event.id) {
+        skippedWithoutId += 1;
+        continue;
+      }
+      const marker = calendarEventMarker(event.id);
+      const existing = this.listTodos(profileId).find((todo) => todo.description.split(/\r?\n/u).includes(marker));
+      if (!existing) {
+        const description = [marker, event.url, event.location ? `Место: ${event.location}` : null]
+          .filter((line): line is string => Boolean(line))
+          .join('\n');
+        created.push(this.createTodo({
+          profileId,
+          title: event.summary,
+          description,
+          dueAt: event.start,
+          tags: ['calendar']
+        }));
+        continue;
+      }
+      const nextTags = [...new Set([...existing.tags, 'calendar'])];
+      if (existing.title !== event.summary || existing.dueAt !== event.start || !existing.tags.includes('calendar')) {
+        const todo = this.updateTodo(profileId, existing.id, {
+          title: event.summary,
+          dueAt: event.start,
+          tags: nextTags
+        });
+        if (todo) updated.push(todo);
+      } else {
+        unchanged.push(existing);
+      }
+    }
+    return { created, updated, unchanged, skippedWithoutId };
+  }
+
   getTodo(profileId: string, id: string): PlannerTodo | null {
     const row = this.db.prepare('SELECT * FROM planner_todos WHERE profile_id = ? AND id = ?').get(profileId, id);
     return row ? toTodo(row as TodoRow) : null;
@@ -337,7 +408,7 @@ export class PlannerStore {
     return { completed, matched, added };
   }
 
-  deleteTodos(profileId: string, input: { all?: boolean; queries?: string[] }): {
+  deleteTodos(profileId: string, input: { all?: boolean; ids?: string[]; queries?: string[] }): {
     deleted: PlannerTodo[];
     notFound: string[];
     ambiguous: Array<{ query: string; candidates: Array<{ id: string; title: string }> }>;
@@ -347,11 +418,18 @@ export class PlannerStore {
       this.db.prepare('DELETE FROM planner_todos WHERE profile_id = ?').run(profileId);
       return { deleted: todos, notFound: [], ambiguous: [] };
     }
-    const queries = input.queries ?? [];
-    if (queries.length === 0) throw new Error('Укажите queries или all=true.');
     const deleted: PlannerTodo[] = [];
     const notFound: string[] = [];
     const ambiguous: Array<{ query: string; candidates: Array<{ id: string; title: string }> }> = [];
+    const ids = [...new Set((input.ids ?? []).map((id) => id.trim()).filter(Boolean))];
+    const queries = input.queries ?? [];
+    if (ids.length === 0 && queries.length === 0) throw new Error('Укажите ids, queries или all=true.');
+    if (ids.length > 50 || queries.length > 50) throw new Error('За один вызов можно удалить не более 50 дел.');
+    for (const id of ids) {
+      const todo = todos.find((item) => item.id === id);
+      if (!todo || !this.deleteTodo(profileId, id)) notFound.push(id);
+      else deleted.push(todo);
+    }
     for (const rawQuery of queries) {
       const query = rawQuery.trim();
       if (!query) continue;
@@ -391,9 +469,14 @@ export class PlannerStore {
     return values.length > 0 ? values : ['default'];
   }
 
-  createSummary(profileId: string, kind: PlannerSummaryKind, periodEnd = new Date()): PlannerSummary {
+  createSummary(
+    profileId: string,
+    kind: PlannerSummaryKind,
+    periodEnd = new Date(),
+    calendarEvents: PlannerCalendarEvent[] = []
+  ): PlannerSummary {
     const end = periodEnd.toISOString();
-    const period = calendarPeriod(kind, periodEnd);
+    const period = plannerSummaryPeriod(kind, periodEnd);
     const start = period.start.toISOString();
     const limit = period.limit.toISOString();
     const todos = this.listTodos(profileId);
@@ -413,19 +496,22 @@ export class PlannerStore {
       pending: pendingTodos.length,
       overdue,
       completionRate: created === 0 ? (completed > 0 ? 100 : 0) : Math.min(100, Math.round((completed / created) * 100)),
-      byPriority
+      byPriority,
+      meetings: calendarEvents.length
     };
     const text = kind === 'daily'
       ? [
         `Сегодня добавлено дел: ${created}, выполнено: ${completed}.`,
         `Сегодня запланировано\n${plannedList(createdTodos)}`,
         `Выполнено сегодня\n${todoList(completedTodos, '• Сегодня завершённых дел нет.')}`,
-        `На сегодня\n${todoList(dueInPeriod.filter((todo) => todo.status === 'pending'), '• Дел со сроком на сегодня нет.')}`
+        `На сегодня\n${todoList(dueInPeriod.filter((todo) => todo.status === 'pending'), '• Дел со сроком на сегодня нет.')}`,
+        `Встречи в календаре\n${meetingList(calendarEvents, '• Встреч на сегодня нет.')}`
       ].join('\n\n')
       : [
         `На текущей неделе добавлено дел: ${created}, выполнено: ${completed}.`,
         `Сделано за неделю\n${todoList(completedTodos, '• На этой неделе завершённых дел нет.')}`,
         `Запланировано за неделю\n${plannedList(createdTodos, '• На этой неделе новых дел не запланировано.')}`,
+        `Встречи недели\n${meetingList(calendarEvents, '• Встреч на этой неделе нет.')}`,
         `Остаётся по делам недели\n${todoList(pendingTodos, '• Остальных дел на этой неделе нет.')}`,
         overdue > 0 ? `Требует внимания\n• Просрочено дел недели: ${overdue}.` : 'Требует внимания\n• Просроченных дел недели нет.'
       ].join('\n\n');
@@ -439,12 +525,12 @@ export class PlannerStore {
     return summary;
   }
 
-  createDailySummary(profileId: string, periodEnd = new Date()): PlannerSummary {
-    return this.createSummary(profileId, 'daily', periodEnd);
+  createDailySummary(profileId: string, periodEnd = new Date(), calendarEvents: PlannerCalendarEvent[] = []): PlannerSummary {
+    return this.createSummary(profileId, 'daily', periodEnd, calendarEvents);
   }
 
-  createWeeklySummary(profileId: string, periodEnd = new Date()): PlannerSummary {
-    return this.createSummary(profileId, 'weekly', periodEnd);
+  createWeeklySummary(profileId: string, periodEnd = new Date(), calendarEvents: PlannerCalendarEvent[] = []): PlannerSummary {
+    return this.createSummary(profileId, 'weekly', periodEnd, calendarEvents);
   }
 
   latestSummary(profileId: string, kind: PlannerSummaryKind = 'weekly'): PlannerSummary | null {

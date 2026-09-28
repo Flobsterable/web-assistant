@@ -3,7 +3,8 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Request, Response } from 'express';
 
-const CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
+const CALENDAR_EVENTS_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+const DEFAULT_CALENDAR_TIME_ZONE = process.env.PLANNER_TIMEZONE?.trim() || 'Asia/Omsk';
 
 export type McpToolDefinition = {
   name: string;
@@ -80,6 +81,45 @@ const listEventsTool: McpToolDefinition = {
   }
 };
 
+const createEventTool: McpToolDefinition = {
+  name: 'google_calendar_create_event',
+  description: 'Создаёт встречу в Google Calendar. Используй для явно запланированной встречи, затем обязательно создай связанное дело через planner_save_todos со сроком, равным началу встречи.',
+  inputSchema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['summary', 'start', 'end'],
+    properties: {
+      calendarId: { type: 'string', description: "ID календаря; по умолчанию 'primary'." },
+      summary: { type: 'string', minLength: 1, maxLength: 300, description: 'Название встречи.' },
+      description: { type: 'string', maxLength: 4000 },
+      location: { type: 'string', maxLength: 500 },
+      start: { type: 'string', format: 'date-time', description: 'Начало встречи в RFC 3339.' },
+      end: { type: 'string', format: 'date-time', description: 'Конец встречи в RFC 3339; должен быть позже начала.' },
+      timeZone: { type: 'string', default: DEFAULT_CALENDAR_TIME_ZONE, description: `IANA timezone. По умолчанию локальный пояс пользователя: ${DEFAULT_CALENDAR_TIME_ZONE}.` },
+      attendees: {
+        type: 'array', maxItems: 50, description: 'Email участников.',
+        items: { type: 'string', format: 'email' }
+      },
+      sendUpdates: { type: 'string', enum: ['all', 'externalOnly', 'none'], default: 'all' }
+    }
+  }
+};
+
+const deleteEventTool: McpToolDefinition = {
+  name: 'google_calendar_delete_event',
+  description: 'Удаляет одно событие Google Calendar по точному eventId. Перед удалением получи eventId через google_calendar_list_events и убедись, что найдено ровно нужное событие.',
+  inputSchema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['eventId'],
+    properties: {
+      calendarId: { type: 'string', description: "ID календаря; по умолчанию 'primary'." },
+      eventId: { type: 'string', minLength: 1, maxLength: 1024, description: 'Точный ID из google_calendar_list_events.' },
+      sendUpdates: { type: 'string', enum: ['all', 'externalOnly', 'none'], default: 'all' }
+    }
+  }
+};
+
 function requireString(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
@@ -152,7 +192,7 @@ export class GoogleCalendarAuth {
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
       response_type: 'code',
-      scope: CALENDAR_READONLY_SCOPE,
+      scope: CALENDAR_EVENTS_SCOPE,
       access_type: 'offline',
       prompt: 'consent',
       include_granted_scopes: 'true',
@@ -185,7 +225,7 @@ export class GoogleCalendarAuth {
       access_token: payload.access_token,
       refresh_token: typeof payload.refresh_token === 'string' ? payload.refresh_token : undefined,
       expires_at: Date.now() + (typeof payload.expires_in === 'number' ? payload.expires_in : 3600) * 1000,
-      scope: typeof payload.scope === 'string' ? payload.scope : CALENDAR_READONLY_SCOPE,
+      scope: typeof payload.scope === 'string' ? payload.scope : CALENDAR_EVENTS_SCOPE,
       token_type: typeof payload.token_type === 'string' ? payload.token_type : 'Bearer'
     });
   }
@@ -254,8 +294,10 @@ export class GoogleCalendarMcpServer {
     handler: (args: unknown) => Promise<McpToolResult>;
   }>();
 
-  constructor(private readonly auth: GoogleCalendarAuth) {
+  constructor(private readonly auth: GoogleCalendarAuth, private readonly fetcher: typeof fetch = fetch) {
     this.registerTool(listEventsTool, (args) => this.listEvents(args));
+    this.registerTool(createEventTool, (args) => this.createEvent(args));
+    this.registerTool(deleteEventTool, (args) => this.deleteEvent(args));
   }
 
   registerTool(definition: McpToolDefinition, handler: (args: unknown) => Promise<McpToolResult>): void {
@@ -291,7 +333,7 @@ export class GoogleCalendarMcpServer {
       url.searchParams.set('orderBy', 'startTime');
       url.searchParams.set('showDeleted', 'false');
 
-      const response = await fetch(url, { headers: { Authorization: `Bearer ${await this.auth.accessToken()}` } });
+      const response = await this.fetcher(url, { headers: { Authorization: `Bearer ${await this.auth.accessToken()}` } });
       const payload = await response.json() as CalendarEventsResponse;
       if (!response.ok) throw new Error(payload.error?.message ?? `Google Calendar API вернул HTTP ${response.status}.`);
       const result = {
@@ -319,6 +361,95 @@ export class GoogleCalendarMcpServer {
       return textResult(result);
     } catch (error) {
       return textResult({ error: error instanceof Error ? error.message : 'Не удалось получить события Google Calendar.' }, true);
+    }
+  }
+
+  private async createEvent(args: unknown): Promise<McpToolResult> {
+    try {
+      const input = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+      const summary = requireString(input.summary, '');
+      if (!summary) throw new Error('summary обязателен.');
+      if (summary.length > 300) throw new Error('summary не должен быть длиннее 300 символов.');
+      const start = optionalDateTime(input.start, 'start');
+      const end = optionalDateTime(input.end, 'end');
+      if (!start || !end) throw new Error('start и end обязательны.');
+      if (Date.parse(end) <= Date.parse(start)) throw new Error('end должен быть позже start.');
+      const calendarId = requireString(input.calendarId, 'primary');
+      const timeZone = typeof input.timeZone === 'string' && input.timeZone.trim()
+        ? input.timeZone.trim()
+        : DEFAULT_CALENDAR_TIME_ZONE;
+      const description = typeof input.description === 'string' ? input.description.trim().slice(0, 4_000) : undefined;
+      const location = typeof input.location === 'string' ? input.location.trim().slice(0, 500) : undefined;
+      const attendees = input.attendees === undefined ? [] : input.attendees;
+      if (!Array.isArray(attendees) || attendees.length > 50 || attendees.some((email) => typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email))) {
+        throw new Error('attendees должен быть массивом корректных email (не более 50).');
+      }
+      const sendUpdates = input.sendUpdates === undefined ? 'all' : input.sendUpdates;
+      if (!['all', 'externalOnly', 'none'].includes(String(sendUpdates))) throw new Error('Некорректное значение sendUpdates.');
+
+      const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`);
+      url.searchParams.set('sendUpdates', String(sendUpdates));
+      const response = await this.fetcher(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${await this.auth.accessToken()}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          summary,
+          ...(description ? { description } : {}),
+          ...(location ? { location } : {}),
+          start: { dateTime: start, timeZone },
+          end: { dateTime: end, timeZone },
+          ...(attendees.length > 0 ? { attendees: attendees.map((email) => ({ email })) } : {})
+        })
+      });
+      const event = await response.json() as CalendarEvent & { error?: { message?: string } };
+      if (!response.ok) throw new Error(event.error?.message ?? `Google Calendar API вернул HTTP ${response.status}.`);
+      return textResult({
+        created: true,
+        event: {
+          id: event.id ?? null,
+          summary: event.summary ?? summary,
+          start: event.start?.dateTime ?? start,
+          end: event.end?.dateTime ?? end,
+          location: event.location ?? location ?? null,
+          url: event.htmlLink ?? null
+        }
+      });
+    } catch (error) {
+      return textResult({ error: error instanceof Error ? error.message : 'Не удалось создать событие Google Calendar.' }, true);
+    }
+  }
+
+  private async deleteEvent(args: unknown): Promise<McpToolResult> {
+    try {
+      const input = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+      const eventId = requireString(input.eventId, '');
+      if (!eventId) throw new Error('eventId обязателен. Сначала найдите событие через google_calendar_list_events.');
+      if (eventId.length > 1_024) throw new Error('eventId слишком длинный.');
+      const calendarId = requireString(input.calendarId, 'primary');
+      const sendUpdates = input.sendUpdates === undefined ? 'all' : input.sendUpdates;
+      if (!['all', 'externalOnly', 'none'].includes(String(sendUpdates))) throw new Error('Некорректное значение sendUpdates.');
+      const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`);
+      url.searchParams.set('sendUpdates', String(sendUpdates));
+      const response = await this.fetcher(url, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${await this.auth.accessToken()}` }
+      });
+      if (!response.ok) {
+        let message = `Google Calendar API вернул HTTP ${response.status}.`;
+        try {
+          const payload = await response.json() as { error?: { message?: string } };
+          message = payload.error?.message ?? message;
+        } catch {
+          // Google can return an empty body for some errors.
+        }
+        throw new Error(message);
+      }
+      return textResult({ deleted: true, eventId, calendarId });
+    } catch (error) {
+      return textResult({ error: error instanceof Error ? error.message : 'Не удалось удалить событие Google Calendar.' }, true);
     }
   }
 

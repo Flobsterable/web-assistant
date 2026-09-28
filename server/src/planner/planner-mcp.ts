@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Request, Response } from 'express';
 import type { McpToolDefinition, McpToolResult } from '../mcp/google-calendar-mcp.js';
-import type { PlannerPriority, PlannerStore, PlannerTodo, PlannerTodoStatus } from './planner-store.js';
+import type { PlannerCalendarEvent, PlannerPriority, PlannerStore, PlannerTodo, PlannerTodoStatus } from './planner-store.js';
 
 type ToolDefinition = McpToolDefinition & {
   title?: string;
@@ -17,11 +17,14 @@ type PlannerReport = {
   markdown: string;
   todoCount: number;
   sourceTodoIds: string[];
+  meetingCount: number;
+  sourceEventIds: string[];
   metrics: {
     pending: number;
     completed: number;
     overdue: number;
     highPriority: number;
+    meetings: number;
   };
 };
 
@@ -105,12 +108,13 @@ const tools: ToolDefinition[] = [
   {
     name: 'planner_delete_todos',
     title: 'Удалить дела',
-    description: 'Удаляет отдельные дела по смысловому названию или полностью очищает список. Используй только когда пользователь явно просит удалить дело или очистить список. Для «очисти список дел» передай all=true.',
+    description: 'Удаляет отдельные дела по точным ID, смысловому названию или полностью очищает список. Для связанной календарной встречи сначала получи ID дела через planner_list_todos. Используй только при явной просьбе об удалении.',
     inputSchema: {
       type: 'object', additionalProperties: false,
       properties: {
         profileId: { type: 'string' },
         all: { type: 'boolean', description: 'Удалить весь список дел.' },
+        ids: { type: 'array', maxItems: 50, description: 'Точные ID из planner_list_todos.', items: { type: 'string', minLength: 1 } },
         queries: { type: 'array', maxItems: 50, items: { type: 'string', minLength: 1, maxLength: 300 } }
       }
     },
@@ -139,13 +143,14 @@ const tools: ToolDefinition[] = [
   {
     name: 'planner_build_report',
     title: 'Сформировать отчёт по делам',
-    description: 'Преобразует результат planner_list_todos в серверный черновик Markdown-отчёта со статистикой, просрочками и рекомендацией. Передай todos без изменений из результата предыдущего инструмента. Инструмент вернёт reportId; затем обязательно передай только этот reportId в planner_validate_report.',
+    description: 'Преобразует результаты planner_list_todos и google_calendar_list_events в единый Markdown-отчёт по делам и встречам. Для дневного или недельного отчёта обязательно передай calendarEvents без изменений из результата календаря за тот же период.',
     inputSchema: {
       type: 'object', additionalProperties: false, required: ['todos'],
       properties: {
         profileId: { type: 'string' },
         title: { type: 'string', maxLength: 120 },
-        todos: { type: 'array', maxItems: 100, items: { type: 'object' } }
+        todos: { type: 'array', maxItems: 100, items: { type: 'object' } },
+        calendarEvents: { type: 'array', maxItems: 100, description: 'Массив events из google_calendar_list_events за период отчёта.', items: { type: 'object' } }
       }
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -239,6 +244,24 @@ function reportTodo(value: unknown, index: number): PlannerTodo {
   };
 }
 
+function reportCalendarEvent(value: unknown, index: number): PlannerCalendarEvent {
+  const item = recordArgs(value);
+  const summary = text(item.summary, `calendarEvents[${index}].summary`, true) as string;
+  const normalizeDate = (raw: unknown, name: string): string | null => {
+    if (raw === null || raw === undefined || raw === '') return null;
+    if (typeof raw !== 'string' || Number.isNaN(Date.parse(raw))) throw new Error(`${name} должен быть датой RFC 3339.`);
+    return new Date(raw).toISOString();
+  };
+  return {
+    id: typeof item.id === 'string' ? item.id : null,
+    summary,
+    start: normalizeDate(item.start, `calendarEvents[${index}].start`),
+    end: normalizeDate(item.end, `calendarEvents[${index}].end`),
+    location: typeof item.location === 'string' ? item.location : null,
+    url: typeof item.url === 'string' ? item.url : null
+  };
+}
+
 function inlineMarkdown(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').replace(/([\\`*_{}[\]()#+.!|>-])/g, '\\$1').trim();
 }
@@ -255,7 +278,20 @@ function reportSection(title: string, todos: PlannerTodo[], emptyText: string): 
   return [`## ${title}`, todos.length > 0 ? todos.map(taskLine).join('\n') : emptyText].join('\n\n');
 }
 
-function buildReport(todos: PlannerTodo[], requestedTitle?: string): PlannerReport {
+function reportMeetingSection(events: PlannerCalendarEvent[]): string {
+  const formatter = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: process.env.PLANNER_TIMEZONE?.trim() || 'Asia/Omsk',
+    weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+  });
+  const lines = events.map((event) => {
+    const when = event.start ? formatter.format(new Date(event.start)) : 'время не указано';
+    const location = event.location ? ` · ${inlineMarkdown(event.location)}` : '';
+    return `- ${when} — ${inlineMarkdown(event.summary)}${location}`;
+  });
+  return ['## Встречи из Google Calendar', lines.length > 0 ? lines.join('\n') : 'Встреч в выбранном периоде нет.'].join('\n\n');
+}
+
+function buildReport(todos: PlannerTodo[], calendarEvents: PlannerCalendarEvent[], requestedTitle?: string): PlannerReport {
   const generatedAt = new Date();
   const pending = todos.filter((todo) => todo.status === 'pending');
   const completed = todos.filter((todo) => todo.status === 'completed');
@@ -273,13 +309,14 @@ function buildReport(todos: PlannerTodo[], requestedTitle?: string): PlannerRepo
     `# ${inlineMarkdown(title)}`,
     `Дата формирования: ${new Intl.DateTimeFormat('ru-RU', { timeZone: process.env.PLANNER_TIMEZONE?.trim() || 'Asia/Omsk', dateStyle: 'long', timeStyle: 'short' }).format(generatedAt)}`,
     '## Статистика',
-    [`- Всего задач: ${todos.length}`, `- Незавершённых: ${pending.length}`, `- Выполненных: ${completed.length}`, `- Просроченных: ${overdue.length}`, `- Высокого приоритета: ${highPriority.length}`].join('\n'),
+    [`- Всего задач: ${todos.length}`, `- Незавершённых: ${pending.length}`, `- Выполненных: ${completed.length}`, `- Просроченных: ${overdue.length}`, `- Высокого приоритета: ${highPriority.length}`, `- Встреч в календаре: ${calendarEvents.length}`].join('\n'),
+    reportMeetingSection(calendarEvents),
     reportSection('Просроченные', overdue, 'Просроченных задач нет.'),
     reportSection('Высокий приоритет', highPriority, 'Срочных задач нет.'),
     reportSection('Остальные незавершённые', pending.filter((todo) => todo.priority !== 'high' && !overdue.some((item) => item.id === todo.id)), 'Других незавершённых задач нет.'),
     reportSection('Выполненные', completed, 'Выполненных задач в выборке нет.'),
     ['## Рекомендация', recommendation].join('\n\n'),
-    `<!-- planner-report:v1;items=${todos.length} -->`
+    `<!-- planner-report:v2;items=${todos.length};meetings=${calendarEvents.length} -->`
   ].join('\n\n');
   return {
     title,
@@ -287,18 +324,21 @@ function buildReport(todos: PlannerTodo[], requestedTitle?: string): PlannerRepo
     markdown,
     todoCount: todos.length,
     sourceTodoIds: todos.map((todo) => todo.id),
-    metrics: { pending: pending.length, completed: completed.length, overdue: overdue.length, highPriority: highPriority.length }
+    meetingCount: calendarEvents.length,
+    sourceEventIds: calendarEvents.flatMap((event) => event.id ? [event.id] : []),
+    metrics: { pending: pending.length, completed: completed.length, overdue: overdue.length, highPriority: highPriority.length, meetings: calendarEvents.length }
   };
 }
 
 function validateReport(candidate: PlannerReport): PlannerReportValidation {
   const issues: string[] = [];
   if (!candidate.markdown.startsWith('# ')) issues.push('Отсутствует заголовок первого уровня.');
-  for (const heading of ['## Статистика', '## Просроченные', '## Высокий приоритет', '## Рекомендация']) {
+  for (const heading of ['## Статистика', '## Встречи из Google Calendar', '## Просроченные', '## Высокий приоритет', '## Рекомендация']) {
     if (!candidate.markdown.includes(heading)) issues.push(`Отсутствует раздел «${heading.slice(3)}».`);
   }
-  if (!candidate.markdown.includes(`<!-- planner-report:v1;items=${candidate.todoCount} -->`)) issues.push('Не совпадает контрольное количество задач.');
+  if (!candidate.markdown.includes(`<!-- planner-report:v2;items=${candidate.todoCount};meetings=${candidate.meetingCount} -->`)) issues.push('Не совпадает контрольное количество задач или встреч.');
   if (candidate.sourceTodoIds.length !== candidate.todoCount) issues.push('Количество исходных ID не совпадает с количеством задач.');
+  if (candidate.metrics.meetings !== candidate.meetingCount) issues.push('Количество встреч не совпадает со статистикой.');
   if (new Set(candidate.sourceTodoIds).size !== candidate.sourceTodoIds.length) issues.push('В исходных ID есть дубликаты.');
   if (candidate.metrics.pending + candidate.metrics.completed !== candidate.todoCount) issues.push('Статистика статусов не сходится с общим количеством задач.');
   if (candidate.metrics.overdue > candidate.metrics.pending) issues.push('Просроченных задач больше, чем незавершённых.');
@@ -377,12 +417,17 @@ export class PlannerMcpServer {
         return todo ? result({ todo }) : result({ error: 'Дело не найдено.' }, true);
       }
       if (name === 'planner_delete_todos') {
+        const ids = input.ids === undefined
+          ? undefined
+          : Array.isArray(input.ids) && input.ids.every((id) => typeof id === 'string')
+            ? input.ids as string[]
+            : (() => { throw new Error('ids должен быть массивом строк.'); })();
         const queries = input.queries === undefined
           ? undefined
           : Array.isArray(input.queries) && input.queries.every((query) => typeof query === 'string')
             ? input.queries as string[]
             : (() => { throw new Error('queries должен быть массивом строк.'); })();
-        const deletion = this.store.deleteTodos(owner, { all: input.all === true, queries });
+        const deletion = this.store.deleteTodos(owner, { all: input.all === true, ids, queries });
         return result({ deletedCount: deletion.deleted.length, ...deletion });
       }
       if (name === 'planner_delete_summaries') {
@@ -396,12 +441,14 @@ export class PlannerMcpServer {
       }
       if (name === 'planner_build_report') {
         if (!Array.isArray(input.todos)) throw new Error('todos должен быть массивом из результата planner_list_todos.');
-        const built = buildReport(input.todos.map(reportTodo), text(input.title, 'title'));
+        if (input.calendarEvents !== undefined && !Array.isArray(input.calendarEvents)) throw new Error('calendarEvents должен быть массивом из результата google_calendar_list_events.');
+        const calendarEvents = (input.calendarEvents ?? []) as unknown[];
+        const built = buildReport(input.todos.map(reportTodo), calendarEvents.map(reportCalendarEvent), text(input.title, 'title'));
         this.cleanupReportPipeline();
         const reportId = randomUUID();
         this.reportDrafts.set(reportId, { profileId: owner, createdAt: Date.now(), report: built });
         const date = built.generatedAt.slice(0, 10);
-        return result({ reportId, todoCount: built.todoCount, metrics: built.metrics, suggestedFileName: `todos-${date}.md` });
+        return result({ reportId, todoCount: built.todoCount, meetingCount: built.meetingCount, metrics: built.metrics, suggestedFileName: `todos-${date}.md` });
       }
       if (name === 'planner_validate_report') {
         this.cleanupReportPipeline();
