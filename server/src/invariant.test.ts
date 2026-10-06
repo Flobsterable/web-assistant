@@ -1,0 +1,276 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { createInvariantRefusal, JsonConversationStore, SimpleAgent, type AgentMessage } from './agent.js';
+import { JsonInvariantStore, parseInvariantAssessment } from './invariant.js';
+import { JsonAgentMemoryStore } from './memory.js';
+import { createTaskLifecycleInvariant } from './task-state.js';
+
+const completion = (answer: string) => ({
+  answer,
+  inputTokens: null,
+  outputTokens: null,
+  totalTokens: null,
+  tokenSource: 'estimated' as const,
+  cost: null,
+  priceCurrency: 'USD',
+  elapsedMs: 1,
+  finishReason: 'stop'
+});
+
+test('invariants are persisted separately from dialogue and memory', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-invariants-'));
+  try {
+    const store = new JsonInvariantStore(path.join(directory, 'invariants', 'profile-a.json'));
+    const invariant = await store.save({
+      category: 'stack-constraint',
+      title: 'Только TypeScript',
+      rule: 'В production-коде разрешён только TypeScript.',
+      rationale: 'Единый стек команды.',
+      enabled: true
+    });
+    assert.equal((await store.active())[0]?.id, invariant.id);
+    const raw = await readFile(path.join(directory, 'invariants', 'profile-a.json'), 'utf8');
+    assert.match(raw, /Только TypeScript/);
+    assert.doesNotMatch(raw, /messages|working|longTerm/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('agent refuses a conflicting request and explains the violated invariant without generating a solution', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-invariant-conflict-'));
+  try {
+    const invariantStore = new JsonInvariantStore(path.join(directory, 'invariants.json'));
+    const invariant = await invariantStore.save({
+      category: 'architecture',
+      title: 'Монолитная архитектура',
+      rule: 'Сервис должен оставаться модульным монолитом; микросервисы запрещены.',
+      rationale: 'Операционная простота.',
+      enabled: true
+    });
+    let generationCalls = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore,
+      assessInvariantCompliance: async ({ candidateAnswer }) => {
+        assert.equal(candidateAnswer, undefined);
+        return { status: 'conflict', violations: [{ id: invariant.id, reason: 'Запрос требует перейти на микросервисы.' }], explanation: 'Конфликт архитектуры.' };
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => { generationCalls += 1; return completion('План миграции на микросервисы'); }
+    });
+    const result = await agent.run('Предложи миграцию на микросервисы');
+    assert.equal(generationCalls, 0);
+    assert.equal(result.finishReason, 'invariant_refusal');
+    assert.equal(result.invariantCompliance?.status, 'conflict');
+    assert.equal(result.invariantCompliance?.phase, 'request');
+    assert.match(result.answer, /Монолитная архитектура/);
+    assert.match(result.answer, /микросервисы/);
+    assert.equal((await agent.history()).length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('invariants are mandatory context and a violating candidate answer is replaced with a refusal', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-invariant-response-'));
+  try {
+    const invariantStore = new JsonInvariantStore(path.join(directory, 'invariants.json'));
+    const invariant = await invariantStore.save({
+      category: 'business-rule', title: 'Без скидок', rule: 'Нельзя обещать скидки выше 10%.', rationale: '', enabled: true
+    });
+    const prompts: AgentMessage[][] = [];
+    let checks = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore,
+      useWorkingMemory: false,
+      useLongTermMemory: false,
+      assessInvariantCompliance: async ({ candidateAnswer }) => {
+        checks += 1;
+        return candidateAnswer === undefined
+          ? { status: 'allowed', violations: [], explanation: 'Запрос совместим.' }
+          : { status: 'conflict', violations: [{ id: invariant.id, reason: 'Ответ обещает скидку 50%.' }], explanation: 'Ответ нарушает правило.' };
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async (messages) => { prompts.push(messages); return completion('Предложим скидку 50%.'); }
+    });
+    const result = await agent.run('Как ответить клиенту?');
+    assert.equal(checks, 2);
+    assert.match(prompts[0].map((message) => message.content).join('\n'), /INVARIANTS[\s\S]*Нельзя обещать скидки выше 10%/);
+    assert.doesNotMatch(result.answer, /Предложим скидку 50%/);
+    assert.match(result.answer, /Без скидок/);
+    assert.equal(result.invariantCompliance?.phase, 'response');
+    assert.deepEqual(result.contextManagement?.invariants.appliedIds, [invariant.id]);
+    assert.equal(result.contextManagement?.invariants.mandatory, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('malformed compliance verdict fails closed', () => {
+  const invariant = {
+    id: 'inv-1', category: 'technical-decision' as const, title: 'SQL', rule: 'Use SQL', rationale: '', enabled: true,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+  };
+  const result = parseInvariantAssessment('not json', [invariant]);
+  assert.equal(result.status, 'uncertain');
+  assert.match(result.explanation, /подтвердить совместимость/);
+});
+
+test('lifecycle violation produces a controlled next-step response', () => {
+  const invariant = createTaskLifecycleInvariant('planning');
+  const answer = createInvariantRefusal([invariant], {
+    status: 'conflict',
+    violations: [{ id: invariant.id, reason: 'План ещё не утверждён.' }],
+    explanation: 'Реализация преждевременна.'
+  }, 'request');
+  assert.match(answer, /Текущий этап — планирование/u);
+  assert.match(answer, /явное утверждение/u);
+  assert.match(answer, /План ещё не утверждён/u);
+  assert.doesNotMatch(answer, /Могу помочь подобрать вариант/u);
+});
+
+test('a direct Planner report action bypasses the task lifecycle invariant at the planning phase', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-lifecycle-'));
+  try {
+    const lifecycle = createTaskLifecycleInvariant('planning');
+    const invariantStore = { active: async () => [lifecycle] };
+    let checks = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore,
+      useWorkingMemory: false,
+      useLongTermMemory: false,
+      assessInvariantCompliance: async ({ candidateAnswer }) => {
+        checks += 1;
+        return candidateAnswer === undefined
+          ? { status: 'allowed', violations: [], explanation: 'Явная операция Planner разрешена.' }
+          : { status: 'conflict', violations: [{ id: lifecycle.id, reason: 'Ложный конфликт.' }], explanation: 'Ложный конфликт.' };
+      },
+      toolRuntime: {
+        resolve: async () => ({
+          contextMessages: [{ role: 'system', content: 'Отчёт сохранён.' }],
+          calls: [{
+            name: 'planner_save_report', arguments: {}, isError: false,
+            result: JSON.stringify({
+              saved: true,
+              path: '/tmp/todos.md',
+              markdown: '# Отчёт по задачам\n\n- Незавершённых: 2',
+              displayInAgent: true
+            })
+          }]
+        })
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Отчёт сохранён в `/tmp/todos.md`.')
+    });
+
+    const result = await agent.run('Составь отчёт по моим незавершённым задачам и сохрани его.');
+    assert.equal(checks, 0);
+    assert.match(result.answer, /Отчёт сохранён/);
+    assert.match(result.answer, /# Отчёт по задачам/);
+    assert.equal(result.finishReason, 'stop');
+    assert.deepEqual(result.invariantCompliance?.appliedIds, []);
+    assert.equal(result.toolCalls?.[0]?.name, 'planner_save_report');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('an atomic calendar meeting flow bypasses the long-running task lifecycle invariant', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-calendar-lifecycle-'));
+  try {
+    const lifecycle = createTaskLifecycleInvariant('planning');
+    let lifecycleChecks = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore: { active: async () => [lifecycle] },
+      useWorkingMemory: false,
+      useLongTermMemory: false,
+      assessInvariantCompliance: async () => {
+        lifecycleChecks += 1;
+        return { status: 'conflict', violations: [{ id: lifecycle.id, reason: 'Ложный конфликт.' }], explanation: 'Ложный конфликт.' };
+      },
+      toolRuntime: {
+        resolve: async () => ({
+          contextMessages: [{ role: 'system', content: 'Встреча и связанное дело созданы.' }],
+          calls: [
+            {
+              name: 'google_calendar_create_event',
+              arguments: { summary: 'Ремонт', start: '2026-10-01T08:00:00.000Z', end: '2026-10-01T09:00:00.000Z' },
+              isError: false,
+              result: JSON.stringify({ created: true, event: { id: 'event-1', start: '2026-10-01T08:00:00.000Z' } })
+            },
+            {
+              name: 'planner_save_todos',
+              arguments: { todos: [{ title: 'Ремонт', dueAt: '2026-10-01T08:00:00.000Z' }] },
+              isError: false,
+              result: JSON.stringify({ count: 1 })
+            }
+          ]
+        })
+      },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Встреча по ремонту создана в календаре и добавлена в дела.')
+    });
+
+    const result = await agent.run('Так, будет встреча в четверг с 2 до 3 по поводу ремонта.');
+    assert.equal(lifecycleChecks, 0);
+    assert.equal(result.finishReason, 'stop');
+    assert.deepEqual(result.toolCalls?.map((call) => call.name), [
+      'google_calendar_create_event', 'planner_save_todos'
+    ]);
+    assert.deepEqual(result.invariantCompliance?.appliedIds, []);
+    assert.match(result.answer, /создана в календаре/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('regular invariants are checked before a Planner write is executed', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-planner-business-rule-'));
+  try {
+    const invariant = {
+      id: 'business-no-reports', category: 'business-rule' as const, title: 'Отчёты запрещены',
+      rule: 'Не создавать отчёты.', rationale: '', enabled: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    };
+    let toolCalls = 0;
+    const agent = new SimpleAgent({
+      name: 'test', provider: 'test', systemPrompt: 'Answer.', temperature: 0, modelTitle: 'fake', model: 'fake',
+      conversationStore: new JsonConversationStore(path.join(directory, 'chat.json')),
+      memoryStore: new JsonAgentMemoryStore(path.join(directory, 'working.json'), path.join(directory, 'long.json')),
+      invariantStore: { active: async () => [createTaskLifecycleInvariant('planning'), invariant] },
+      assessInvariantCompliance: async ({ invariants }) => invariants.some((item) => item.id === invariant.id)
+        ? { status: 'conflict', violations: [{ id: invariant.id, reason: 'Отчёты запрещены.' }], explanation: 'Конфликт бизнес-правила.' }
+        : { status: 'allowed', violations: [], explanation: 'Разрешено.' },
+      toolRuntime: { resolve: async () => { toolCalls += 1; return { contextMessages: [], calls: [] }; } },
+      tokenPricing: { inputPricePerMillion: null, outputPricePerMillion: null, priceCurrency: 'USD' },
+      tokenBudget: { maxContextTokens: 10_000, reservedOutputTokens: 500 },
+      complete: async () => completion('Не должно вызываться.')
+    });
+
+    const result = await agent.run('Составь и сохрани отчёт.');
+    assert.equal(toolCalls, 0);
+    assert.equal(result.invariantCompliance?.status, 'conflict');
+    assert.match(result.answer, /Отчёты запрещены/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
