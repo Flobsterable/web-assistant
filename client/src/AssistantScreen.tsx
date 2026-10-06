@@ -477,6 +477,7 @@ export default function AssistantScreen({
   const [memoryValue, setMemoryValue] = useState('');
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
+  const [useRag, setUseRag] = useState(() => readMemoryToggle('use-rag'));
   const [useWorkingMemory, setUseWorkingMemory] = useState(() => readMemoryToggle('use-working-memory'));
   const [useLongTermMemory, setUseLongTermMemory] = useState(() => readMemoryToggle('use-long-term-memory'));
   const [selectedModelId, setSelectedModelId] = useState(() => window.localStorage.getItem('agent-model-id') ?? 'flash');
@@ -971,6 +972,7 @@ export default function AssistantScreen({
           sessionId,
           profileId: selectedProfileId,
           modelId: selectedModel?.id,
+          useRag,
           useWorkingMemory,
           useLongTermMemory,
           documentNames: uploadedDocumentNames,
@@ -1244,6 +1246,20 @@ export default function AssistantScreen({
             </div>
 
             <div className="memory-switches" aria-label="Использование памяти в ответах">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={useRag}
+                title="Искать релевантные фрагменты в локальном индексе и добавлять их в контекст модели"
+                onClick={() => {
+                  const nextValue = !useRag;
+                  setUseRag(nextValue);
+                  window.localStorage.setItem('use-rag', String(nextValue));
+                }}
+              >
+                <strong>RAG</strong>
+                <span className="memory-switch-control" aria-hidden="true" />
+              </button>
               <button
                 type="button"
                 role="switch"

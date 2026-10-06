@@ -166,6 +166,7 @@ type AgentRequest = {
   sessionId?: string;
   profileId: string;
   modelId?: string;
+  useRag: boolean;
   useWorkingMemory: boolean;
   useLongTermMemory: boolean;
   documentNames: string[];
@@ -562,6 +563,7 @@ function readAgentRequest(body: unknown): AgentRequest | string {
   const rawSessionId = typeof candidate.sessionId === 'string' ? candidate.sessionId : undefined;
   const profileId = normalizeProfileId(candidate.profileId);
   const modelId = typeof candidate.modelId === 'string' ? candidate.modelId.trim() : undefined;
+  const useRag = candidate.useRag !== false;
   const useWorkingMemory = candidate.useWorkingMemory !== false;
   const useLongTermMemory = candidate.useLongTermMemory !== false;
   const documentNames = Array.isArray(candidate.documentNames)
@@ -570,7 +572,7 @@ function readAgentRequest(body: unknown): AgentRequest | string {
   const retrievalStrategy: ChunkingStrategy = candidate.retrievalStrategy === 'fixed' ? 'fixed' : 'structural';
   if (!message) return 'Message is required.';
 
-  return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useWorkingMemory, useLongTermMemory, documentNames, retrievalStrategy };
+  return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useRag, useWorkingMemory, useLongTermMemory, documentNames, retrievalStrategy };
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -1008,7 +1010,8 @@ function createAgent(
   memoryUsage?: { working: boolean; longTerm: boolean },
   userProfile?: UserProfile,
   attachedDocumentNames: string[] = [],
-  retrievalStrategy: ChunkingStrategy = 'structural'
+  retrievalStrategy: ChunkingStrategy = 'structural',
+  useRag = true
 ) {
   const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   const mcpRuntime = new McpAgentRuntime(
@@ -1056,6 +1059,8 @@ function createAgent(
     complete: (messages, options) => requestCompletion(agentModel, messages, options),
     toolRuntime: {
       async resolve(userRequest) {
+        if (!useRag) return mcpRuntime.resolve(userRequest);
+
         const [mcp, index] = await Promise.all([
           mcpRuntime.resolve(userRequest),
           loadIndex(documentIndexPath)
@@ -1699,7 +1704,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   const agent = createAgent(agentModel, sessionId, {
     working: request.useWorkingMemory,
     longTerm: request.useLongTermMemory
-  }, userProfile, request.documentNames, request.retrievalStrategy);
+  }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag);
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
 
   try {
