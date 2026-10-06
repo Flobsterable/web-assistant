@@ -142,6 +142,11 @@ type SimpleAgentOptions = {
     candidateAnswer?: string;
   }) => Promise<InvariantAssessment>;
   toolRuntime?: AgentToolRuntime;
+  transformAnswer?: (params: {
+    answer: string;
+    userRequest: string;
+    toolCalls: AgentToolCall[];
+  }) => string | Promise<string>;
 };
 
 type PersistedConversation = {
@@ -300,6 +305,7 @@ export class SimpleAgent {
   private readonly invariantStore?: { active: () => Promise<Invariant[]> };
   private readonly assessInvariants?: SimpleAgentOptions['assessInvariantCompliance'];
   private readonly toolRuntime?: AgentToolRuntime;
+  private readonly transformAnswer?: SimpleAgentOptions['transformAnswer'];
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -322,6 +328,7 @@ export class SimpleAgent {
     this.invariantStore = options.invariantStore;
     this.assessInvariants = options.assessInvariantCompliance;
     this.toolRuntime = options.toolRuntime;
+    this.transformAnswer = options.transformAnswer;
   }
 
   async history() {
@@ -397,7 +404,14 @@ export class SimpleAgent {
       ],
       { temperature: this.temperature }
     );
-    const answer = withSavedReport(completion.answer, toolResolution.calls);
+    const completionAnswer = withSavedReport(completion.answer, toolResolution.calls);
+    const answer = this.transformAnswer
+      ? await this.transformAnswer({
+          answer: completionAnswer,
+          userRequest: normalizedRequest,
+          toolCalls: toolResolution.calls
+        })
+      : completionAnswer;
 
     const responseInvariants = performedDirectPersonalAction
       ? regularInvariants

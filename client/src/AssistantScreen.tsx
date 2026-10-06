@@ -43,11 +43,13 @@ type RagResultSet = {
   query: string;
   candidatesCount: number;
   selectedCount: number;
+  groundedCount: number;
   averageRelevance: number;
   sources: Array<{
     source: string;
     title: string;
     section: string;
+    chunkId: string;
     vectorScore: number;
     relevanceScore: number;
   }>;
@@ -437,14 +439,14 @@ function RagResultCard({
     <section className="rag-result-card">
       <div><strong>{title}</strong><em>{contextLabel}</em></div>
       <p>
-        Найдено фрагментов: {result.candidatesCount}. Передано модели: {result.selectedCount}.
+        Найдено фрагментов: {result.candidatesCount}. Выбрано retrieval: {result.selectedCount}. Разрешено для ответа: {result.groundedCount}.
         {result.selectedCount > 0 && <> Средняя оценка: {Math.round(result.averageRelevance * 100)}%.</>}
       </p>
       {result.sources.length > 0 ? (
         <ul>
           {result.sources.map((source, index) => (
             <li key={`${source.source}-${source.section}-${index}`}>
-              <span>{source.source} · {source.section}</span>
+              <span>{source.source} · {source.section} · {source.chunkId}</span>
               <b>{Math.round(source.relevanceScore * 100)}%</b>
             </li>
           ))}

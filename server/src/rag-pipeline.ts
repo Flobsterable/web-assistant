@@ -187,11 +187,13 @@ export function publicRagDiagnostics(retrieval: RagRetrieval) {
     query: set.query,
     candidatesCount: set.candidatesCount,
     selectedCount: set.selected.length,
+    groundedCount: set.selected.filter((match) => match.relevanceScore >= retrieval.config.relevanceThreshold).length,
     averageRelevance: set.averageRelevance,
     sources: set.selected.map((match) => ({
       source: match.metadata.source,
       title: match.metadata.title,
       section: match.metadata.section,
+      chunkId: match.metadata.chunk_id,
       vectorScore: round(match.score),
       relevanceScore: match.relevanceScore
     }))
