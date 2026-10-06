@@ -57,6 +57,14 @@ import {
   type ChunkingSettings,
   type ChunkingStrategy
 } from './indexer.js';
+import {
+  DEFAULT_RAG_CONFIG,
+  publicRagDiagnostics,
+  runRagRetrieval,
+  type RagConfig,
+  type RagMatch,
+  type RagMode
+} from './rag-pipeline.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -171,6 +179,7 @@ type AgentRequest = {
   useLongTermMemory: boolean;
   documentNames: string[];
   retrievalStrategy: ChunkingStrategy;
+  ragMode: RagMode;
 };
 
 type PublicAgentMessage = {
@@ -570,9 +579,89 @@ function readAgentRequest(body: unknown): AgentRequest | string {
     ? candidate.documentNames.map(safeDocumentName).filter((name): name is string => Boolean(name)).slice(0, 10)
     : [];
   const retrievalStrategy: ChunkingStrategy = candidate.retrievalStrategy === 'fixed' ? 'fixed' : 'structural';
+  const ragMode: RagMode = candidate.ragMode === 'baseline' || candidate.ragMode === 'improved'
+    ? candidate.ragMode
+    : 'compare';
   if (!message) return 'Message is required.';
 
-  return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useRag, useWorkingMemory, useLongTermMemory, documentNames, retrievalStrategy };
+  return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useRag, useWorkingMemory, useLongTermMemory, documentNames, retrievalStrategy, ragMode };
+}
+
+function readRagConfig(): RagConfig {
+  const searchTopK = Math.max(1, Math.round(readOptionalNumberEnv('RAG_SEARCH_TOP_K') ?? DEFAULT_RAG_CONFIG.searchTopK));
+  return {
+    searchTopK,
+    filteredTopK: Math.min(
+      searchTopK,
+      Math.max(1, Math.round(readOptionalNumberEnv('RAG_FILTERED_TOP_K') ?? DEFAULT_RAG_CONFIG.filteredTopK))
+    ),
+    relevanceThreshold: Math.min(
+      1,
+      readOptionalNumberEnv('RAG_RELEVANCE_THRESHOLD') ?? DEFAULT_RAG_CONFIG.relevanceThreshold
+    )
+  };
+}
+
+const noRelevantContextAnswer = 'В локальной базе знаний недостаточно релевантной информации для ответа.';
+
+async function generateIsolatedRagAnswer(
+  model: ModelConfig,
+  question: string,
+  matches: RagMatch[]
+) {
+  if (matches.length === 0) return noRelevantContextAnswer;
+  const context = matches.map((match, index) => [
+    `[${index + 1}] source: ${match.metadata.source}; section: ${match.metadata.section}`,
+    match.content
+  ].join('\n')).join('\n\n');
+  return (await requestCompletion(model, [
+    {
+      role: 'system',
+      content: 'Ответь только по предоставленному контексту. После каждого утверждения указывай источник в формате [1]. Если данных для ответа нет, прямо скажи, что в базе недостаточно информации.'
+    },
+    { role: 'user', content: `Вопрос: ${question}\n\nКонтекст:\n${context}` }
+  ], { temperature: 0 })).answer;
+}
+
+async function createRagAnswerComparison(
+  model: ModelConfig,
+  request: AgentRequest,
+  toolCalls: Array<{ name: string; arguments: Record<string, unknown> }> | undefined
+) {
+  if (!request.useRag || request.ragMode !== 'compare') return undefined;
+  const searchCall = toolCalls?.find((call) => call.name === 'knowledge_search');
+  const rewrittenQuery = typeof searchCall?.arguments.rewrittenQuery === 'string'
+    ? searchCall.arguments.rewrittenQuery
+    : request.message;
+  const index = await loadIndex(documentIndexPath);
+  if (!index || index.document_count === 0) return undefined;
+
+  const retrieval = runRagRetrieval({
+    index,
+    originalQuery: request.message,
+    rewrittenQuery,
+    strategy: request.retrievalStrategy,
+    mode: 'compare',
+    config: readRagConfig(),
+    sourceNames: request.documentNames
+  });
+  const [baseline, improved] = await Promise.all([
+    generateIsolatedRagAnswer(model, request.message, retrieval.baseline.selected),
+    generateIsolatedRagAnswer(model, request.message, retrieval.improved.selected)
+  ]);
+  return { baseline, improved };
+}
+
+function formatRagAnswerComparison(comparison: { baseline: string; improved: string }) {
+  return [
+    'СРАВНЕНИЕ ОТВЕТОВ',
+    '',
+    'БЕЗ УЛУЧШЕНИЙ',
+    comparison.baseline,
+    '',
+    'REWRITE + RERANKING + ФИЛЬТР',
+    comparison.improved
+  ].join('\n');
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -1011,7 +1100,8 @@ function createAgent(
   userProfile?: UserProfile,
   attachedDocumentNames: string[] = [],
   retrievalStrategy: ChunkingStrategy = 'structural',
-  useRag = true
+  useRag = true,
+  ragMode: RagMode = 'compare'
 ) {
   const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   const mcpRuntime = new McpAgentRuntime(
@@ -1067,14 +1157,56 @@ function createAgent(
         ]);
         if (!index || index.document_count === 0) return mcp;
 
-        const attachedMatches = index.chunks
-          .filter((chunk) => chunk.metadata.strategy === retrievalStrategy && attachedDocumentNames.includes(chunk.metadata.source))
-          .slice(0, 6)
-          .map((chunk) => ({ ...chunk, score: 1 }));
-        const matches = attachedMatches.length > 0
-          ? attachedMatches
-          : searchIndex(index, userRequest, retrievalStrategy, 4).filter((match) => match.score > 0.08);
-        if (matches.length === 0) return mcp;
+        let rewrittenQuery = userRequest;
+        if (ragMode !== 'baseline') {
+          try {
+            rewrittenQuery = (await requestCompletion(agentModel, [
+              {
+                role: 'system',
+                content: 'Перепиши вопрос в один короткий самодостаточный поисковый запрос. Сохрани язык, имена, даты, коды и исходный смысл. Не отвечай на вопрос и не добавляй пояснений.'
+              },
+              { role: 'user', content: userRequest }
+            ], { temperature: 0 })).answer.replace(/^['"«]|['"»]$/g, '').trim() || userRequest;
+          } catch (error) {
+            console.warn('RAG query rewrite failed; using the original query.', error);
+          }
+        }
+
+        const retrieval = runRagRetrieval({
+          index,
+          originalQuery: userRequest,
+          rewrittenQuery,
+          strategy: retrievalStrategy,
+          mode: ragMode,
+          config: readRagConfig(),
+          sourceNames: attachedDocumentNames
+        });
+        const matches = retrieval.active.selected;
+        const diagnostics = publicRagDiagnostics(retrieval);
+        const ragCall = {
+          name: 'knowledge_search',
+          arguments: {
+            query: userRequest,
+            rewrittenQuery,
+            strategy: retrievalStrategy,
+            mode: ragMode,
+            searchTopK: retrieval.config.searchTopK,
+            filteredTopK: retrieval.config.filteredTopK,
+            relevanceThreshold: retrieval.config.relevanceThreshold
+          },
+          result: JSON.stringify(diagnostics),
+          isError: false
+        };
+
+        if (matches.length === 0) {
+          return {
+            contextMessages: [...mcp.contextMessages, {
+              role: 'system' as const,
+              content: 'Поиск по локальной базе знаний не нашёл фрагментов, прошедших порог релевантности. Не придумывай факты из документов: прямо сообщи, что в базе недостаточно информации.'
+            }],
+            calls: [...mcp.calls, ragCall]
+          };
+        }
 
         const knowledgeContext: AgentMessage = {
           role: 'system',
@@ -1089,17 +1221,7 @@ function createAgent(
         };
         return {
           contextMessages: [...mcp.contextMessages, knowledgeContext],
-          calls: [...mcp.calls, {
-            name: 'knowledge_search',
-            arguments: { query: userRequest, strategy: retrievalStrategy, limit: 4 },
-            result: JSON.stringify(matches.map((match) => ({
-              source: match.metadata.source,
-              title: match.metadata.title,
-              section: match.metadata.section,
-              score: Number(match.score.toFixed(4))
-            }))),
-            isError: false
-          }]
+          calls: [...mcp.calls, ragCall]
         };
       }
     }
@@ -1704,7 +1826,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   const agent = createAgent(agentModel, sessionId, {
     working: request.useWorkingMemory,
     longTerm: request.useLongTermMemory
-  }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag);
+  }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag, request.ragMode);
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
 
   try {
@@ -1754,6 +1876,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       provider: agentDefinition.provider,
       model: agentModel.model
     });
+    const ragComparisonPromise = createRagAnswerComparison(agentModel, request, result.toolCalls);
     await logger.step('invariant_check', async () => result.invariantCompliance ?? null, {
       invariantCompliance: result.invariantCompliance
     });
@@ -1861,8 +1984,12 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       }
     }
     const memoryEvents = workingEvent ? [workingEvent, ...policyEvents] : policyEvents;
+    const ragComparison = await ragComparisonPromise;
     return res.json({
       ...result,
+      ragMode: request.useRag ? request.ragMode : null,
+      ...(ragComparison ? { answer: formatRagAnswerComparison(ragComparison) } : {}),
+      ...(ragComparison ? { ragComparison } : {}),
       turnId: logger.turnId,
       memoryReflection: reflection,
       memoryEvents,

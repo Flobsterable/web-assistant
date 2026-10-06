@@ -30,6 +30,41 @@ type AgentResponse = {
     result: string;
     isError: boolean;
   }>;
+  ragComparison?: {
+    baseline: string;
+    improved: string;
+  };
+  ragMode?: RagMode | null;
+};
+
+type RagMode = 'baseline' | 'improved' | 'compare';
+
+type RagResultSet = {
+  query: string;
+  candidatesCount: number;
+  selectedCount: number;
+  averageRelevance: number;
+  sources: Array<{
+    source: string;
+    title: string;
+    section: string;
+    vectorScore: number;
+    relevanceScore: number;
+  }>;
+};
+
+type RagDiagnostics = {
+  mode: RagMode;
+  originalQuery: string;
+  rewrittenQuery: string;
+  config: {
+    searchTopK: number;
+    filteredTopK: number;
+    relevanceThreshold: number;
+  };
+  baseline: RagResultSet;
+  improved: RagResultSet;
+  active: 'baseline' | 'improved';
 };
 
 type AgentErrorResponse = {
@@ -371,18 +406,133 @@ function readMemoryToggle(key: string) {
   return window.localStorage.getItem(key) !== 'false';
 }
 
+function readRagMode(): RagMode {
+  const value = window.localStorage.getItem('rag-mode');
+  return value === 'baseline' || value === 'improved' ? value : 'compare';
+}
+
+function getRagDiagnostics(message: ChatMessage): RagDiagnostics | null {
+  const call = message.meta?.toolCalls?.find((item) => item.name === 'knowledge_search' && !item.isError);
+  if (!call) return null;
+  try {
+    const parsed = JSON.parse(call.result) as RagDiagnostics;
+    return parsed?.baseline && parsed?.improved ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function RagResultCard({
+  title,
+  result,
+  contextLabel,
+  threshold
+}: {
+  title: string;
+  result: RagResultSet;
+  contextLabel: string;
+  threshold: number;
+}) {
+  return (
+    <section className="rag-result-card">
+      <div><strong>{title}</strong><em>{contextLabel}</em></div>
+      <p>
+        Найдено фрагментов: {result.candidatesCount}. Передано модели: {result.selectedCount}.
+        {result.selectedCount > 0 && <> Средняя оценка: {Math.round(result.averageRelevance * 100)}%.</>}
+      </p>
+      {result.sources.length > 0 ? (
+        <ul>
+          {result.sources.map((source, index) => (
+            <li key={`${source.source}-${source.section}-${index}`}>
+              <span>{source.source} · {source.section}</span>
+              <b>{Math.round(source.relevanceScore * 100)}%</b>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <small>
+          Ничего не передано модели: ни один найденный фрагмент не набрал минимальные {Math.round(threshold * 100)}%.
+        </small>
+      )}
+    </section>
+  );
+}
+
+function RagDiagnosticsPanel({ diagnostics }: { diagnostics: RagDiagnostics }) {
+  const isComparison = diagnostics.mode === 'compare';
+  const baselineContextLabel = isComparison
+    ? 'контекст ответа «Без улучшений»'
+    : diagnostics.active === 'baseline' ? 'использовано для ответа' : 'показано для сравнения';
+  const improvedContextLabel = isComparison
+    ? 'контекст улучшенного ответа'
+    : diagnostics.active === 'improved' ? 'использовано для ответа' : 'показано для сравнения';
+
+  return (
+    <details className="rag-diagnostics" open={diagnostics.mode === 'compare'}>
+      <summary>Какие фрагменты документов использованы для ответов</summary>
+      <p className="rag-explanation">
+        Слева обычный поиск передаёт модели найденные фрагменты без проверки. Справа запрос уточняется,
+        результаты пересортировываются, а фрагменты ниже порога отбрасываются.
+      </p>
+      {diagnostics.rewrittenQuery !== diagnostics.originalQuery && (
+        <p className="rag-rewrite"><strong>Запрос после переформулировки:</strong> {diagnostics.rewrittenQuery}</p>
+      )}
+      <div className="rag-comparison-grid">
+        <RagResultCard
+          title="Обычный поиск"
+          result={diagnostics.baseline}
+          contextLabel={baselineContextLabel}
+          threshold={diagnostics.config.relevanceThreshold}
+        />
+        <RagResultCard
+          title="Поиск с улучшениями"
+          result={diagnostics.improved}
+          contextLabel={improvedContextLabel}
+          threshold={diagnostics.config.relevanceThreshold}
+        />
+      </div>
+      <footer>
+        Настройки: ищем до {diagnostics.config.searchTopK} фрагментов; после фильтра оставляем максимум{' '}
+        {diagnostics.config.filteredTopK}; минимальная релевантность — {Math.round(diagnostics.config.relevanceThreshold * 100)}%.
+      </footer>
+    </details>
+  );
+}
+
+function RagAnswerComparison({ comparison }: { comparison: NonNullable<AgentResponse['ragComparison']> }) {
+  return (
+    <section className="rag-answer-comparison" aria-label="Сравнение ответов RAG">
+      <header><strong>Сравнение ответов</strong><span>Изолированный A/B-тест на одинаковом вопросе</span></header>
+      <div>
+        <article>
+          <h4>Без улучшений</h4>
+          <p>{comparison.baseline}</p>
+        </article>
+        <article className="improved">
+          <h4>Rewrite + фильтр</h4>
+          <p>{comparison.improved}</p>
+        </article>
+      </div>
+    </section>
+  );
+}
+
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isAgent = message.role === 'agent';
   const visibleMemoryEvents = message.meta?.memoryEvents?.filter((event) => event.type !== 'skipped' && event.type !== 'invalid_candidate') ?? [];
+  const ragDiagnostics = getRagDiagnostics(message);
 
   return (
     <article className={`message ${message.role}`}>
       <div className="message-label">{isAgent ? 'Агент' : 'Вы'}</div>
-      <div className="message-body">{message.content}</div>
+      <div className="message-body">
+        {message.meta?.ragComparison ? 'Ниже показаны два независимо сгенерированных ответа на один вопрос.' : message.content}
+      </div>
       {message.meta && (
         <footer className="message-meta">
           <span>{message.meta.modelTitle}</span>
           <span>{formatDuration(message.meta.elapsedMs)}</span>
+          <span>RAG: {message.meta.ragMode === 'compare' ? 'сравнение · 2 ответа' : message.meta.ragMode === 'improved' ? 'improved · 1 ответ' : message.meta.ragMode === 'baseline' ? 'baseline · 1 ответ' : 'выключен'}</span>
         </footer>
       )}
       {visibleMemoryEvents.length > 0 ? (
@@ -394,6 +544,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           ))}
         </footer>
       ) : null}
+      {message.meta?.ragComparison && <RagAnswerComparison comparison={message.meta.ragComparison} />}
+      {ragDiagnostics && <RagDiagnosticsPanel diagnostics={ragDiagnostics} />}
       {message.meta?.contextManagement && (
         <details className="message-details">
           <summary>Технические детали</summary>
@@ -478,6 +630,7 @@ export default function AssistantScreen({
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
   const [useRag, setUseRag] = useState(() => readMemoryToggle('use-rag'));
+  const [ragMode, setRagMode] = useState<RagMode>(() => readRagMode());
   const [useWorkingMemory, setUseWorkingMemory] = useState(() => readMemoryToggle('use-working-memory'));
   const [useLongTermMemory, setUseLongTermMemory] = useState(() => readMemoryToggle('use-long-term-memory'));
   const [selectedModelId, setSelectedModelId] = useState(() => window.localStorage.getItem('agent-model-id') ?? 'flash');
@@ -976,7 +1129,8 @@ export default function AssistantScreen({
           useWorkingMemory,
           useLongTermMemory,
           documentNames: uploadedDocumentNames,
-          retrievalStrategy
+          retrievalStrategy,
+          ragMode
         })
       });
 
@@ -1289,6 +1443,23 @@ export default function AssistantScreen({
                 <span className="memory-switch-control" aria-hidden="true" />
               </button>
             </div>
+
+            <label className="rag-mode-selector">
+              <span><strong>Режим RAG</strong><small>Baseline отключает rewrite и фильтр; сравнение показывает метрики обоих режимов.</small></span>
+              <select
+                value={ragMode}
+                disabled={!useRag}
+                onChange={(event) => {
+                  const nextMode = event.target.value as RagMode;
+                  setRagMode(nextMode);
+                  window.localStorage.setItem('rag-mode', nextMode);
+                }}
+              >
+                <option value="compare">Сравнение · 2 ответа</option>
+                <option value="improved">Rewrite + фильтр · 1 ответ</option>
+                <option value="baseline">Без улучшений · 1 ответ</option>
+              </select>
+            </label>
 
             {pendingMemory.length > 0 && (
               <div className="pending-memory">

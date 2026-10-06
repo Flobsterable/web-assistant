@@ -306,10 +306,17 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0);
 }
 
-export function searchIndex(index: DocumentIndex, query: string, strategy: ChunkingStrategy, limit = 5) {
+export function searchIndex(
+  index: DocumentIndex,
+  query: string,
+  strategy: ChunkingStrategy,
+  limit = 5,
+  sourceNames: string[] = []
+) {
   const queryEmbedding = createEmbedding(query);
   return index.chunks
-    .filter((chunk) => chunk.metadata.strategy === strategy)
+    .filter((chunk) => chunk.metadata.strategy === strategy &&
+      (sourceNames.length === 0 || sourceNames.includes(chunk.metadata.source)))
     .map((chunk) => ({ ...chunk, score: cosineSimilarity(queryEmbedding, chunk.embedding) }))
     .sort((left, right) => right.score - left.score)
     .slice(0, limit);

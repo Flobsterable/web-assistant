@@ -747,6 +747,12 @@ select {
 .memory-switches button[aria-checked="true"] .memory-switch-control { background: #2d806f; }
 .memory-switches button[aria-checked="true"] .memory-switch-control::after { transform: translateX(12px); }
 .memory-switches button:focus-visible { outline: 3px solid rgba(45, 128, 111, .2); outline-offset: 2px; }
+.rag-mode-selector { display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #d8e6e1; border-radius: 8px; padding: 10px; background: #f5fbf9; }
+.rag-mode-selector span, .rag-mode-selector small { display: block; }
+.rag-mode-selector strong { color: #253540; font-size: 12px; }
+.rag-mode-selector small { margin-top: 3px; color: #71808a; font-size: 10px; font-weight: 500; }
+.rag-mode-selector select { min-width: 230px; min-height: 36px; border: 1px solid #b9cec7; border-radius: 7px; padding: 0 9px; background: #fff; }
+.rag-mode-selector select:disabled { cursor: not-allowed; opacity: .55; }
 .memory-settings { display: grid; gap: 12px; border-top: 1px solid #e2e8eb; padding-top: 12px; }
 .profile-editor { display: grid; gap: 10px; border-bottom: 1px solid #e2e8eb; padding-bottom: 14px; }
 .profile-form { display: grid; grid-template-columns: 140px minmax(220px, 1.3fr) 1fr 1fr minmax(220px, 1.2fr) auto; gap: 8px; align-items: end; }
@@ -1086,7 +1092,9 @@ h1 {
 }
 
 .message {
+  display: block;
   width: min(760px, 100%);
+  max-width: 100%;
   border: 1px solid #dbe3e7;
   border-radius: 8px;
   padding: 13px 14px;
@@ -1094,12 +1102,18 @@ h1 {
 }
 
 .message.user {
+  display: block;
+  width: min(760px, 100%);
+  max-width: 78%;
   align-self: flex-end;
   border-color: #c7dcd5;
   background: #f2faf7;
 }
 
 .message.agent {
+  display: block;
+  width: min(1040px, 100%);
+  max-width: 100%;
   align-self: flex-start;
 }
 
@@ -1138,6 +1152,32 @@ h1 {
 .message-details summary { width: max-content; cursor: pointer; color: #71808a; font-weight: 700; }
 .message-details-grid { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 8px; }
 .message-details-grid span { white-space: nowrap; }
+.rag-diagnostics { margin-top: 10px; border: 1px solid #d8e6e1; border-radius: 9px; padding: 10px; color: #52636e; background: #f8fbfa; font-size: 10px; }
+.rag-diagnostics > summary { cursor: pointer; color: #246c5f; }
+.rag-explanation { margin: 9px 0 0; color: #52636e; line-height: 1.45; }
+.rag-rewrite { margin: 9px 0 0; color: #41535e; font-size: 11px; }
+.rag-comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
+.rag-result-card { border: 1px solid #dfe7ea; border-radius: 7px; padding: 9px; background: #fff; }
+.rag-result-card > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.rag-result-card em { color: #2d806f; font-size: 9px; font-style: normal; }
+.rag-result-card p { margin: 7px 0; }
+.rag-result-card ul { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.rag-result-card li { display: flex; justify-content: space-between; gap: 8px; }
+.rag-result-card li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rag-result-card li b { color: #2d806f; }
+.rag-diagnostics > footer { margin-top: 8px; color: #71808a; }
+.rag-answer-comparison { margin-top: 10px; border: 1px solid #cddfd9; border-radius: 9px; padding: 10px; background: #f8fbfa; }
+.rag-answer-comparison > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; color: #253540; font-size: 11px; }
+.rag-answer-comparison > header span { color: #71808a; font-size: 9px; }
+.rag-answer-comparison > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
+.rag-answer-comparison article { border: 1px solid #dfe7ea; border-radius: 7px; padding: 10px; background: #fff; }
+.rag-answer-comparison article.improved { border-color: #76ad9f; box-shadow: inset 0 0 0 1px #b8d7ce; }
+.rag-answer-comparison h4 { margin: 0 0 7px; color: #41535e; font-size: 10px; }
+.rag-answer-comparison p { margin: 0; color: #253540; font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
+
+@media (max-width: 760px) {
+  .rag-answer-comparison > div, .rag-comparison-grid { grid-template-columns: 1fr; }
+}
 
 .compression-meta {
   color: #64756f;

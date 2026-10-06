@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "index": "npm run build && node dist/build-index.js",
+    "index:aurora": "npm run build && node dist/seed-aurora.js",
+    "evaluate:rag": "npm run build && node dist/evaluate-rag.js",
     "build": "tsc",
     "test": "npm run build && node --test dist/*.test.js",
     "start": "node dist/index.js"
