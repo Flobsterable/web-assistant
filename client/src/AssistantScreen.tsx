@@ -35,6 +35,26 @@ type AgentResponse = {
     improved: string;
   };
   ragMode?: RagMode | null;
+  grounding: Grounding;
+  taskMemory: TaskMemoryState;
+};
+
+type Grounding = {
+  status: 'grounded' | 'unknown';
+  sources: Array<{ source: string; section: string; chunkId: string; relevance: number }>;
+  citations: Array<{ chunkId: string; quote: string }>;
+};
+
+type TaskMemoryState = {
+  version: 1;
+  sessionId: string;
+  goal: string | null;
+  clarifiedFacts: Array<{ key: string; value: string; sourceMessageId: string }>;
+  constraints: Array<{ id: string; value: string; sourceMessageId: string }>;
+  terminology: Array<{ term: string; meaning: string; sourceMessageId: string }>;
+  openQuestions: string[];
+  currentStep: string | null;
+  updatedAt: string;
 };
 
 type RagMode = 'baseline' | 'improved' | 'compare';
@@ -115,6 +135,7 @@ type ChatMessage = {
   meta?: AgentResponse;
   tokenMeta?: RequestTokenMeta;
   responseMeta?: ResponseTokenMeta;
+  grounding?: Grounding;
 };
 
 type AgentSession = {
@@ -523,6 +544,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   const isAgent = message.role === 'agent';
   const visibleMemoryEvents = message.meta?.memoryEvents?.filter((event) => event.type !== 'skipped' && event.type !== 'invalid_candidate') ?? [];
   const ragDiagnostics = getRagDiagnostics(message);
+  const grounding = message.meta?.grounding ?? message.grounding;
 
   return (
     <article className={`message ${message.role}`}>
@@ -547,6 +569,25 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </footer>
       ) : null}
       {message.meta?.ragComparison && <RagAnswerComparison comparison={message.meta.ragComparison} />}
+      {isAgent && grounding && (
+        <details className="grounding-panel" open>
+          <summary>
+            Grounding: {grounding.status === 'grounded' ? 'подтверждён' : 'не подтверждён'}
+          </summary>
+          {grounding.sources.length > 0 ? (
+            <>
+              <strong>Источники</strong>
+              <ul>{grounding.sources.map((source) => (
+                <li key={source.chunkId}>{source.source} — {source.section} — {source.chunkId} ({Math.round(source.relevance * 100)}%)</li>
+              ))}</ul>
+              <strong>Цитаты</strong>
+              <ul>{grounding.citations.map((citation, index) => (
+                <li key={`${citation.chunkId}-${index}`}>«{citation.quote}» — {citation.chunkId}</li>
+              ))}</ul>
+            </>
+          ) : <p>Релевантный контекст не прошёл проверку.</p>}
+        </details>
+      )}
       {ragDiagnostics && <RagDiagnosticsPanel diagnostics={ragDiagnostics} />}
       {message.meta?.contextManagement && (
         <details className="message-details">
@@ -597,6 +638,27 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
+function TaskMemoryPanel({ state, onClear }: { state?: TaskMemoryState; onClear: () => void }) {
+  if (!state) return null;
+  const hasContent = Boolean(state.goal || state.currentStep || state.clarifiedFacts.length || state.constraints.length || state.terminology.length || state.openQuestions.length);
+  return (
+    <details className="task-memory-panel">
+      <summary><span>Память задачи</span><b>{hasContent ? 'активна' : 'пуста'}</b></summary>
+      <div className="task-memory-content">
+        <dl>
+          <div><dt>Цель</dt><dd>{state.goal ?? '—'}</dd></div>
+          <div><dt>Текущий шаг</dt><dd>{state.currentStep ?? '—'}</dd></div>
+        </dl>
+        {state.clarifiedFacts.length > 0 && <section><strong>Уточнённые факты</strong><ul>{state.clarifiedFacts.map((item) => <li key={item.key}><b>{item.key}:</b> {item.value}</li>)}</ul></section>}
+        {state.constraints.length > 0 && <section><strong>Ограничения</strong><ul>{state.constraints.map((item) => <li key={item.id}>{item.value}</li>)}</ul></section>}
+        {state.terminology.length > 0 && <section><strong>Термины</strong><ul>{state.terminology.map((item) => <li key={item.term}><b>{item.term}:</b> {item.meaning}</li>)}</ul></section>}
+        {state.openQuestions.length > 0 && <section><strong>Открытые вопросы</strong><ul>{state.openQuestions.map((item) => <li key={item}>{item}</li>)}</ul></section>}
+        <button className="reset-button" type="button" onClick={onClear} disabled={!hasContent}>Очистить память текущего чата</button>
+      </div>
+    </details>
+  );
+}
+
 type AssistantView = 'chat' | 'planner' | 'mcp';
 type RetrievalStrategy = 'fixed' | 'structural';
 
@@ -623,6 +685,7 @@ export default function AssistantScreen({
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [memory, setMemory] = useState<MemoryResponse>();
+  const [taskMemory, setTaskMemory] = useState<TaskMemoryState>();
   const [pendingMemory, setPendingMemory] = useState<PendingMemorySuggestion[]>([]);
   const [tasks, setTasks] = useState<TaskState[]>([]);
   const [memoryLayer, setMemoryLayer] = useState<MemoryLayer>('working');
@@ -704,12 +767,13 @@ export default function AssistantScreen({
       try {
         const sessionQuery = new URLSearchParams({ sessionId }).toString();
         const memoryQuery = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
-        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, pendingResponse, tasksResponse, invariantsResponse] = await Promise.all([
+        const [configResponse, profilesResponse, chatsResponse, historyResponse, memoryResponse, taskMemoryResponse, pendingResponse, tasksResponse, invariantsResponse] = await Promise.all([
           fetch('/api/config', { signal: controller.signal }),
           fetch('/api/profiles', { signal: controller.signal }),
           fetch('/api/agent/chats', { signal: controller.signal }),
           fetch(`/api/agent/history?${sessionQuery}`, { signal: controller.signal }),
           fetch(`/api/agent/memory?${memoryQuery}`, { signal: controller.signal }),
+          fetch(`/api/agent/task-memory?${sessionQuery}`, { signal: controller.signal }),
           fetch(`/api/agent/memory/pending?${memoryQuery}`, { signal: controller.signal }),
           fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`, { signal: controller.signal }),
           fetch('/api/invariants', { signal: controller.signal })
@@ -764,6 +828,7 @@ export default function AssistantScreen({
         if (memoryResponse.ok) {
           setMemory((await memoryResponse.json()) as MemoryResponse);
         }
+        if (taskMemoryResponse.ok) setTaskMemory((await taskMemoryResponse.json()) as TaskMemoryState);
         if (pendingResponse.ok) {
           setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
         }
@@ -795,6 +860,7 @@ export default function AssistantScreen({
     setMessages([]);
     setHistoryStats(undefined);
     setMemory(undefined);
+    setTaskMemory(undefined);
     setPendingMemory([]);
     setError('');
   }
@@ -889,15 +955,28 @@ export default function AssistantScreen({
 
   async function refreshMemory() {
     const query = new URLSearchParams({ sessionId, profileId: selectedProfileId }).toString();
-    const [response, pendingResponse, tasksResponse] = await Promise.all([
+    const [response, taskMemoryResponse, pendingResponse, tasksResponse] = await Promise.all([
       fetch(`/api/agent/memory?${query}`),
+      fetch(`/api/agent/task-memory?${new URLSearchParams({ sessionId })}`),
       fetch(`/api/agent/memory/pending?${query}`),
       fetch(`/api/tasks?${new URLSearchParams({ profileId: selectedProfileId })}`)
     ]);
-    if (!response.ok || !pendingResponse.ok || !tasksResponse.ok) throw new Error('Не удалось загрузить память.');
+    if (!response.ok || !taskMemoryResponse.ok || !pendingResponse.ok || !tasksResponse.ok) throw new Error('Не удалось загрузить память.');
     setMemory((await response.json()) as MemoryResponse);
+    setTaskMemory((await taskMemoryResponse.json()) as TaskMemoryState);
     setPendingMemory(((await pendingResponse.json()) as PendingMemoryResponse).suggestions);
     setTasks(((await tasksResponse.json()) as TasksResponse).tasks);
+  }
+
+  async function handleClearTaskMemory() {
+    setError('');
+    try {
+      const response = await fetch(`/api/agent/task-memory?${new URLSearchParams({ sessionId })}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error('Не удалось очистить память задачи.');
+      await refreshMemory();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Не удалось очистить память задачи.');
+    }
   }
 
   async function handleOpenTask(task: TaskState) {
@@ -1155,6 +1234,7 @@ export default function AssistantScreen({
       }
 
       const agentResponse = data as AgentResponse;
+      setTaskMemory(agentResponse.taskMemory);
       if (agentResponse.session) setSession(agentResponse.session);
       if (agentResponse.stats) setHistoryStats(agentResponse.stats);
       void refreshChats();
@@ -1606,6 +1686,8 @@ export default function AssistantScreen({
           </section>
           </div>
           )}
+
+        <TaskMemoryPanel state={taskMemory} onClear={() => void handleClearTaskMemory()} />
 
         <section className="chat-panel" aria-live="polite">
           {messages.length === 0 ? (

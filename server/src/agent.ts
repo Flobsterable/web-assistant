@@ -28,11 +28,19 @@ export type AgentToolRuntime = {
   resolve(userRequest: string): Promise<{ contextMessages: AgentMessage[]; calls: AgentToolCall[] }>;
 };
 
+export type AgentGrounding = {
+  status: 'grounded' | 'unknown';
+  sources: Array<{ source: string; section: string; chunkId: string; relevance: number }>;
+  citations: Array<{ chunkId: string; quote: string }>;
+};
+
 export type StoredAgentMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   createdAt: string;
+  sessionId?: string;
+  grounding?: AgentGrounding;
 };
 
 export type ConversationContextReport = {
@@ -97,6 +105,7 @@ export type AgentRunResult = AgentCompletionResult & {
   modelTitle: string;
   model: string;
   toolCalls?: AgentToolCall[];
+  grounding?: AgentGrounding;
 };
 
 export class AgentContextOverflowError extends Error {
@@ -113,7 +122,7 @@ type CompletionClient = (messages: AgentMessage[], options?: { temperature?: num
 
 type ConversationStore = {
   load: () => Promise<StoredAgentMessage[]>;
-  appendMany: (messages: Array<Omit<StoredAgentMessage, 'id' | 'createdAt'>>) => Promise<StoredAgentMessage[]>;
+  appendMany: (messages: Array<Omit<StoredAgentMessage, 'id' | 'createdAt' | 'sessionId'> & { id?: string }>) => Promise<StoredAgentMessage[]>;
   clear: () => Promise<void>;
 };
 
@@ -142,11 +151,12 @@ type SimpleAgentOptions = {
     candidateAnswer?: string;
   }) => Promise<InvariantAssessment>;
   toolRuntime?: AgentToolRuntime;
+  taskMemoryMessage?: AgentMessage;
   transformAnswer?: (params: {
     answer: string;
     userRequest: string;
     toolCalls: AgentToolCall[];
-  }) => string | Promise<string>;
+  }) => { answer: string; grounding?: AgentGrounding } | Promise<{ answer: string; grounding?: AgentGrounding }>;
 };
 
 type PersistedConversation = {
@@ -156,6 +166,8 @@ type PersistedConversation = {
 
 type PreparedContext = {
   messages: AgentMessage[];
+  prefixMessages: AgentMessage[];
+  historyMessages: AgentMessage[];
   exactMessages: StoredAgentMessage[];
   memory: MemorySnapshot;
   report: ConversationContextReport;
@@ -209,14 +221,15 @@ export class JsonConversationStore implements ConversationStore {
 
   constructor(
     private readonly filePath: string,
-    private readonly maxStoredMessages = 400
+    private readonly maxStoredMessages = 400,
+    private readonly sessionId = path.basename(filePath, path.extname(filePath))
   ) {}
 
   async load() {
     return (await this.loadPersisted()).messages;
   }
 
-  async appendMany(messagesToAppend: Array<Omit<StoredAgentMessage, 'id' | 'createdAt'>>) {
+  async appendMany(messagesToAppend: Array<Omit<StoredAgentMessage, 'id' | 'createdAt' | 'sessionId'> & { id?: string }>) {
     return this.enqueueWrite(async () => {
       const persisted = await this.loadPersisted();
       const createdAt = new Date().toISOString();
@@ -224,7 +237,8 @@ export class JsonConversationStore implements ConversationStore {
         ...persisted.messages,
         ...messagesToAppend.map((message) => ({
           ...message,
-          id: createMessageId(),
+          id: message.id ?? createMessageId(),
+          sessionId: this.sessionId,
           createdAt
         }))
       ].slice(-this.maxStoredMessages);
@@ -246,7 +260,9 @@ export class JsonConversationStore implements ConversationStore {
       const parsed = JSON.parse(rawContent) as Partial<PersistedConversation>;
 
       return {
-        messages: Array.isArray(parsed.messages) ? parsed.messages.filter(isStoredAgentMessage) : []
+        messages: Array.isArray(parsed.messages)
+          ? parsed.messages.filter(isStoredAgentMessage).map((message) => ({ ...message, sessionId: message.sessionId ?? this.sessionId }))
+          : []
       };
     } catch (error) {
       if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
@@ -306,6 +322,7 @@ export class SimpleAgent {
   private readonly assessInvariants?: SimpleAgentOptions['assessInvariantCompliance'];
   private readonly toolRuntime?: AgentToolRuntime;
   private readonly transformAnswer?: SimpleAgentOptions['transformAnswer'];
+  private readonly taskMemoryMessage?: AgentMessage;
 
   constructor(options: SimpleAgentOptions) {
     this.name = options.name;
@@ -329,6 +346,7 @@ export class SimpleAgent {
     this.assessInvariants = options.assessInvariantCompliance;
     this.toolRuntime = options.toolRuntime;
     this.transformAnswer = options.transformAnswer;
+    this.taskMemoryMessage = options.taskMemoryMessage;
   }
 
   async history() {
@@ -343,7 +361,7 @@ export class SimpleAgent {
     return this.memoryStore.load();
   }
 
-  async run(userRequest: string): Promise<AgentRunResult> {
+  async run(userRequest: string, options?: { userMessageId?: string }): Promise<AgentRunResult> {
     const normalizedRequest = userRequest.trim();
 
     if (!normalizedRequest) {
@@ -395,8 +413,9 @@ export class SimpleAgent {
           role: 'system',
           content: this.systemPrompt
         },
-        ...preparedContext.messages,
+        ...preparedContext.prefixMessages,
         ...toolResolution.contextMessages,
+        ...preparedContext.historyMessages,
         {
           role: 'user',
           content: normalizedRequest
@@ -405,13 +424,14 @@ export class SimpleAgent {
       { temperature: this.temperature }
     );
     const completionAnswer = withSavedReport(completion.answer, toolResolution.calls);
-    const answer = this.transformAnswer
+    const transformed = this.transformAnswer
       ? await this.transformAnswer({
           answer: completionAnswer,
           userRequest: normalizedRequest,
           toolCalls: toolResolution.calls
         })
-      : completionAnswer;
+      : { answer: completionAnswer };
+    const answer = transformed.answer;
 
     const responseInvariants = performedDirectPersonalAction
       ? regularInvariants
@@ -423,12 +443,14 @@ export class SimpleAgent {
 
     await this.conversationStore.appendMany([
       {
+        id: options?.userMessageId,
         role: 'user',
         content: normalizedRequest
       },
       {
         role: 'assistant',
-        content: answer
+        content: answer,
+        grounding: transformed.grounding
       }
     ]);
 
@@ -458,6 +480,7 @@ export class SimpleAgent {
       agentProvider: this.provider,
       modelTitle: this.modelTitle,
       model: this.model,
+      ...(transformed.grounding ? { grounding: transformed.grounding } : {}),
       ...(toolResolution.calls.length > 0 ? { toolCalls: toolResolution.calls } : {})
     };
   }
@@ -499,7 +522,9 @@ export class SimpleAgent {
     const invariantMessage = createInvariantMessage(invariants);
     const longTermMessages = createMemoryMessages('long-term', activeLongTerm);
     const workingMessages = createMemoryMessages('working', activeWorking);
-    const messages = [...(invariantMessage ? [invariantMessage] : []), profileMessage, ...longTermMessages, ...workingMessages, ...exactMessages.map(toAgentMessage)];
+    const prefixMessages = [...(invariantMessage ? [invariantMessage] : []), profileMessage, ...longTermMessages, ...workingMessages, ...(this.taskMemoryMessage ? [this.taskMemoryMessage] : [])];
+    const rawHistoryMessages = exactMessages.map(toAgentMessage);
+    const messages = [...prefixMessages, ...rawHistoryMessages];
     const priorities = [
       ...(invariantMessage ? [6] : []),
       5,
@@ -508,6 +533,7 @@ export class SimpleAgent {
         .slice()
         .sort((left, right) => Number(['goal', 'constraint'].includes(left.category)) - Number(['goal', 'constraint'].includes(right.category)))
         .map((entry) => (entry.category === 'goal' || entry.category === 'constraint' ? 4 : 2)),
+      ...(this.taskMemoryMessage ? [5] : []),
       ...exactMessages.map(() => 3)
     ];
     const contextMessages = this.trimContextMessages(
@@ -518,6 +544,8 @@ export class SimpleAgent {
 
     return {
       messages: contextMessages,
+      prefixMessages: prefixMessages.filter((message) => contextMessages.includes(message)),
+      historyMessages: rawHistoryMessages.filter((message) => contextMessages.includes(message)),
       exactMessages,
       memory,
       report: this.createContextReport({

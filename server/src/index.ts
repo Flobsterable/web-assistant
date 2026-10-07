@@ -70,8 +70,16 @@ import {
   createUnknownResult,
   formatGroundedAnswer,
   isPersonalWriteTool,
+  toAgentGrounding,
   validateGroundedAnswer
 } from './grounded-answer.js';
+import {
+  buildTaskMemorySearchQuery,
+  createTaskMemoryMessage,
+  extractTaskMemoryPatch,
+  JsonTaskMemoryStore,
+  type TaskMemoryState
+} from './task-memory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -196,6 +204,7 @@ type PublicAgentMessage = {
   createdAt: string;
   tokenMeta?: PublicRequestTokenMeta;
   responseMeta?: PublicResponseTokenMeta;
+  grounding?: import('./agent.js').AgentGrounding;
 };
 
 type PublicAgentWindow = {
@@ -411,6 +420,7 @@ const agentSessionsPath = path.join(agentDataPath, 'agent-sessions');
 const workingMemoryPath = path.join(agentDataPath, 'memory', 'working');
 const longTermMemoryPath = path.join(agentDataPath, 'memory', 'long-term');
 const pendingMemoryPath = path.join(agentDataPath, 'memory', 'pending');
+const taskMemoryPath = path.join(agentDataPath, 'task-memory');
 const profilesPath = path.join(agentDataPath, 'profiles');
 const agentLogsPath = path.join(agentDataPath, 'agent-logs');
 const tasksPath = path.join(agentDataPath, 'tasks');
@@ -657,18 +667,6 @@ async function createRagAnswerComparison(
   return { baseline, improved };
 }
 
-function formatRagAnswerComparison(comparison: { baseline: string; improved: string }) {
-  return [
-    'СРАВНЕНИЕ ОТВЕТОВ',
-    '',
-    'БЕЗ УЛУЧШЕНИЙ',
-    comparison.baseline,
-    '',
-    'REWRITE + RERANKING + ФИЛЬТР',
-    comparison.improved
-  ].join('\n');
-}
-
 function buildChatCompletionsUrl(baseUrl: string) {
   if (baseUrl.endsWith('/chat/completions')) return baseUrl;
   return `${baseUrl}/chat/completions`;
@@ -838,6 +836,7 @@ function toPublicAgentMessage(
     role: message.role === 'assistant' ? 'agent' : 'user',
     content: message.content,
     createdAt: message.createdAt,
+    grounding: message.grounding,
     tokenMeta,
     responseMeta
   };
@@ -883,7 +882,11 @@ function getChatUpdatedAt(history: Awaited<ReturnType<SimpleAgent['history']>>) 
 }
 
 function createAgentConversationStore(sessionId: string) {
-  return new JsonConversationStore(path.join(agentSessionsPath, `${sessionId}.json`));
+  return new JsonConversationStore(path.join(agentSessionsPath, `${sessionId}.json`), 400, sessionId);
+}
+
+function createTaskMemoryStore(sessionId: string) {
+  return new JsonTaskMemoryStore(path.join(taskMemoryPath, `${sessionId}.json`), sessionId);
 }
 
 function createAgentMemoryStore(sessionId: string, profileId = defaultProfileId) {
@@ -1094,6 +1097,7 @@ async function deleteAgentSessionData(sessionId: string) {
     rm(path.join(agentSessionsPath, `${sessionId}.json`), { force: true }),
     rm(path.join(workingMemoryPath, `${sessionId}.json`), { force: true }),
     rm(path.join(pendingMemoryPath, `${sessionId}.json`), { force: true }),
+    rm(path.join(taskMemoryPath, `${sessionId}.json`), { force: true }),
     rm(path.join(agentLogsPath, sessionId), { recursive: true, force: true })
   ]);
 }
@@ -1106,7 +1110,8 @@ function createAgent(
   attachedDocumentNames: string[] = [],
   retrievalStrategy: ChunkingStrategy = 'structural',
   useRag = true,
-  ragMode: RagMode = 'compare'
+  ragMode: RagMode = 'compare',
+  taskMemory?: TaskMemoryState
 ) {
   const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   let activeRagMatches: RagMatch[] | null = null;
@@ -1152,11 +1157,13 @@ function createAgent(
     keepLastMessages: readOptionalNumberEnv('AGENT_CONTEXT_KEEP_LAST_MESSAGES') ?? 5,
     useWorkingMemory: memoryUsage?.working ?? true,
     useLongTermMemory: memoryUsage?.longTerm ?? true,
+    taskMemoryMessage: taskMemory ? createTaskMemoryMessage(taskMemory) : undefined,
     complete: (messages, options) => requestCompletion(agentModel, messages, options),
     transformAnswer: ({ answer, toolCalls }) => {
       const usedKnowledgeSearch = toolCalls.some((call) => call.name === 'knowledge_search' && !call.isError);
-      if (!useRag || !usedKnowledgeSearch || activeRagMatches === null) return answer;
-      return formatGroundedAnswer(validateGroundedAnswer(answer, activeRagMatches));
+      if (!useRag || !usedKnowledgeSearch || activeRagMatches === null) return { answer };
+      const result = validateGroundedAnswer(answer, activeRagMatches, readRagConfig().relevanceThreshold);
+      return { answer: formatGroundedAnswer(result), grounding: toAgentGrounding(result, activeRagMatches) };
     },
     toolRuntime: {
       async resolve(userRequest) {
@@ -1169,9 +1176,25 @@ function createAgent(
         ]);
         const performedPersonalWrite = mcp.calls.some((call) => !call.isError && isPersonalWriteTool(call.name));
         if (performedPersonalWrite) return mcp;
-        if (!index || index.document_count === 0) return mcp;
+        if (!index || index.document_count === 0) {
+          activeRagMatches = [];
+          const ragCall = {
+            name: 'knowledge_search',
+            arguments: { query: userRequest, rewrittenQuery: userRequest, strategy: retrievalStrategy, mode: ragMode },
+            result: JSON.stringify({ error: 'empty_index', selectedCount: 0 }),
+            isError: false
+          };
+          return {
+            contextMessages: [...mcp.contextMessages, {
+              role: 'system' as const,
+              content: 'RAG_CONTEXT пуст: индекс документов отсутствует или пуст. Верни только JSON {"answer":"","citations":[]}.'
+            }],
+            calls: [...mcp.calls, ragCall]
+          };
+        }
 
-        let rewrittenQuery = userRequest;
+        const memoryQuery = taskMemory ? buildTaskMemorySearchQuery(userRequest, taskMemory) : userRequest;
+        let rewrittenQuery = memoryQuery;
         if (ragMode !== 'baseline') {
           try {
             rewrittenQuery = (await requestCompletion(agentModel, [
@@ -1179,8 +1202,8 @@ function createAgent(
                 role: 'system',
                 content: 'Перепиши вопрос в один короткий самодостаточный поисковый запрос. Сохрани язык, имена, даты, коды и исходный смысл. Не отвечай на вопрос и не добавляй пояснений.'
               },
-              { role: 'user', content: userRequest }
-            ], { temperature: 0 })).answer.replace(/^['"«]|['"»]$/g, '').trim() || userRequest;
+              { role: 'user', content: memoryQuery }
+            ], { temperature: 0 })).answer.replace(/^['"«]|['"»]$/g, '').trim() || memoryQuery;
           } catch (error) {
             console.warn('RAG query rewrite failed; using the original query.', error);
           }
@@ -1188,7 +1211,7 @@ function createAgent(
 
         const retrieval = runRagRetrieval({
           index,
-          originalQuery: userRequest,
+          originalQuery: ragMode === 'baseline' ? memoryQuery : userRequest,
           rewrittenQuery,
           strategy: retrievalStrategy,
           mode: ragMode,
@@ -1205,6 +1228,7 @@ function createAgent(
           arguments: {
             query: userRequest,
             rewrittenQuery,
+            memoryQuery,
             strategy: retrievalStrategy,
             mode: ragMode,
             searchTopK: retrieval.config.searchTopK,
@@ -1353,6 +1377,25 @@ app.get('/api/agent/history', async (req: Request, res: Response) => {
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to load agent history.'
     });
+  }
+});
+
+app.get('/api/agent/task-memory', async (req: Request, res: Response) => {
+  try {
+    const sessionId = readSessionIdFromRequest(req);
+    return res.json(await createTaskMemoryStore(sessionId).load());
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load task memory.' });
+  }
+});
+
+app.delete('/api/agent/task-memory', async (req: Request, res: Response) => {
+  try {
+    const sessionId = readSessionIdFromRequest(req);
+    await rm(path.join(taskMemoryPath, `${sessionId}.json`), { force: true });
+    return res.status(204).send();
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to clear task memory.' });
   }
 });
 
@@ -1662,6 +1705,7 @@ app.delete('/api/agent/chats', async (_req: Request, res: Response) => {
       rm(agentSessionsPath, { recursive: true, force: true }),
       rm(workingMemoryPath, { recursive: true, force: true }),
       rm(pendingMemoryPath, { recursive: true, force: true }),
+      rm(taskMemoryPath, { recursive: true, force: true }),
       rm(agentLogsPath, { recursive: true, force: true })
     ]);
     return res.status(204).send();
@@ -1830,13 +1874,26 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   if (!userProfile) {
     return res.status(400).json({ error: `Профиль ${request.profileId} не найден.` });
   }
-  const agent = createAgent(agentModel, sessionId, {
-    working: request.useWorkingMemory,
-    longTerm: request.useLongTermMemory
-  }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag, request.ragMode);
   const logger = new AgentTurnLogger(agentLogsPath, sessionId);
+  const userMessageId = `msg-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 
   try {
+    const taskMemoryStore = createTaskMemoryStore(sessionId);
+    let taskMemory = await taskMemoryStore.load();
+    try {
+      const patch = await logger.step('task_memory_extract', () => extractTaskMemoryPatch({
+        state: taskMemory,
+        userMessage: request.message,
+        complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
+      }), { provider: agentDefinition.provider, model: agentModel.model });
+      taskMemory = await logger.step('task_memory_persist', () => taskMemoryStore.update(patch, userMessageId));
+    } catch (error) {
+      console.warn('Task memory update failed; continuing with the last valid state.', error);
+    }
+    const agent = createAgent(agentModel, sessionId, {
+      working: request.useWorkingMemory,
+      longTerm: request.useLongTermMemory
+    }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag, request.ragMode, taskMemory);
     const taskStore = createTaskStateStore(request.profileId);
     let [memoryBeforeTaskCommand, historyBeforeTaskCommand, savedTasks] = await Promise.all([
       createAgentMemoryStore(sessionId, request.profileId).load(),
@@ -1879,7 +1936,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     }
     const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId, request.profileId).load());
     await logger.step('context_assembly', async () => { await agent.inspectNextRun(request.message); });
-    const result = await logger.step('provider_request', () => agent.run(request.message), {
+    const result = await logger.step('provider_request', () => agent.run(request.message, { userMessageId }), {
       provider: agentDefinition.provider,
       model: agentModel.model
     });
@@ -1994,8 +2051,9 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     const ragComparison = await ragComparisonPromise;
     return res.json({
       ...result,
+      taskMemory,
+      grounding: result.grounding ?? { status: 'unknown', sources: [], citations: [] },
       ragMode: request.useRag ? request.ragMode : null,
-      ...(ragComparison ? { answer: formatRagAnswerComparison(ragComparison) } : {}),
       ...(ragComparison ? { ragComparison } : {}),
       turnId: logger.turnId,
       memoryReflection: reflection,

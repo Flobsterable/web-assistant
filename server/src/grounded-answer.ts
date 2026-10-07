@@ -1,4 +1,5 @@
 import type { AgentMessage } from './agent.js';
+import type { AgentGrounding } from './agent.js';
 import { tokenize, type RagMatch } from './rag-pipeline.js';
 
 export type GroundedCitation = {
@@ -65,8 +66,9 @@ export function createGroundingMessage(matches: RagMatch[]): AgentMessage {
   };
 }
 
-export function validateGroundedAnswer(rawAnswer: string, matches: RagMatch[]): GroundedAnswerResult {
-  if (matches.length === 0) return createUnknownResult();
+export function validateGroundedAnswer(rawAnswer: string, matches: RagMatch[], relevanceThreshold = 0): GroundedAnswerResult {
+  const eligibleMatches = matches.filter((match) => match.relevanceScore >= relevanceThreshold);
+  if (eligibleMatches.length === 0) return createUnknownResult();
 
   let payload: Record<string, unknown>;
   try {
@@ -81,7 +83,7 @@ export function validateGroundedAnswer(rawAnswer: string, matches: RagMatch[]): 
   const rawCitations = Array.isArray(payload.citations) ? payload.citations as ModelCitation[] : [];
   if (!answer || rawCitations.length === 0) return createUnknownResult();
 
-  const chunksById = new Map(matches.map((match) => [match.metadata.chunk_id, match]));
+  const chunksById = new Map(eligibleMatches.map((match) => [match.metadata.chunk_id, match]));
   const citations: GroundedCitation[] = [];
   for (const candidate of rawCitations) {
     if (!candidate || typeof candidate !== 'object') return createUnknownResult();
@@ -118,7 +120,7 @@ export function formatGroundedAnswer(result: GroundedAnswerResult) {
       result.answer,
       '',
       'Источники:',
-      '- Нет: релевантный контекст не прошёл порог.',
+      '- Нет: релевантный контекст не прошёл проверку.',
       '',
       'Цитаты:',
       '- Нет: цитировать неподтверждённые фрагменты нельзя.'
@@ -139,6 +141,25 @@ export function formatGroundedAnswer(result: GroundedAnswerResult) {
     'Цитаты:',
     ...result.citations.map((citation) => `- «${citation.quote}» — ${citation.source}, ${citation.section}, chunk_id: ${citation.chunkId}`)
   ].join('\n');
+}
+
+export function toAgentGrounding(result: GroundedAnswerResult, matches: RagMatch[]): AgentGrounding {
+  if (result.status === 'unknown') return { status: 'unknown', sources: [], citations: [] };
+  const byId = new Map(matches.map((match) => [match.metadata.chunk_id, match]));
+  const sources = [...new Map(result.citations.map((citation) => {
+    const match = byId.get(citation.chunkId)!;
+    return [citation.chunkId, {
+      source: match.metadata.source,
+      section: match.metadata.section,
+      chunkId: citation.chunkId,
+      relevance: match.relevanceScore
+    }];
+  })).values()];
+  return {
+    status: 'grounded',
+    sources,
+    citations: result.citations.map(({ chunkId, quote }) => ({ chunkId, quote }))
+  };
 }
 
 export function createUnknownResult(): UnknownAnswer {

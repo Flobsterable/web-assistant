@@ -139,6 +139,25 @@ test('weak context and an invented quote force the explicit unknown mode', () =>
   assert.equal(invented.status, 'unknown');
 });
 
+test('unknown chunk ids and chunks below the relevance threshold are rejected', () => {
+  const match: RagMatch = {
+    content: 'RTO системы составляет 45 минут.',
+    metadata: { source: 'ops.md', title: 'Эксплуатация', section: 'Восстановление', chunk_id: 'ops-1', strategy: 'structural' },
+    embedding: [], token_count: 7, score: 0.9, relevanceScore: 0.21
+  };
+  const unknownChunk = validateGroundedAnswer(JSON.stringify({
+    answer: 'RTO составляет 45 минут.',
+    citations: [{ chunk_id: 'ops-invented', quote: 'RTO системы составляет 45 минут.' }]
+  }), [match]);
+  assert.equal(unknownChunk.status, 'unknown');
+
+  const belowThreshold = validateGroundedAnswer(JSON.stringify({
+    answer: 'RTO составляет 45 минут.',
+    citations: [{ chunk_id: 'ops-1', quote: 'RTO системы составляет 45 минут.' }]
+  }), [match], 0.22);
+  assert.equal(belowThreshold.status, 'unknown');
+});
+
 test('read-only calendar and planner calls do not bypass RAG grounding', () => {
   assert.equal(isPersonalWriteTool('google_calendar_list_events'), false);
   assert.equal(isPersonalWriteTool('planner_list_todos'), false);
