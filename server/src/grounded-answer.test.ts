@@ -3,7 +3,7 @@ import { copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { answerMeaningMatchesCitations, formatGroundedAnswer, isPersonalWriteTool, validateGroundedAnswer } from './grounded-answer.js';
+import { answerMeaningMatchesCitations, formatGroundedAnswer, isPersonalWriteTool, validateGroundedAnswer, validateGroundedAnswerWithRetry } from './grounded-answer.js';
 import { buildIndex } from './indexer.js';
 import type { RagMatch } from './rag-pipeline.js';
 
@@ -156,6 +156,83 @@ test('unknown chunk ids and chunks below the relevance threshold are rejected', 
     citations: [{ chunk_id: 'ops-1', quote: 'RTO системы составляет 45 минут.' }]
   }), [match], 0.22);
   assert.equal(belowThreshold.status, 'unknown');
+});
+
+test('a short task clarification can be grounded by an exact document quote', () => {
+  const match: RagMatch = {
+    content: 'Контрольная дата промышленного запуска — 17 ноября 2027 года. Пилот начинается 6 сентября 2027 года.',
+    metadata: { source: 'overview.md', title: 'Аврора', section: 'Сроки', chunk_id: 'overview-2027', strategy: 'structural' },
+    embedding: [], token_count: 20, score: 0.9, relevanceScore: 0.9
+  };
+  const result = validateGroundedAnswer(JSON.stringify({
+    answer: 'Принято, рассматриваем только 2027 год.',
+    citations: [{
+      chunk_id: 'overview-2027',
+      quote: 'Контрольная дата промышленного запуска — 17 ноября 2027 года. Пилот начинается 6 сентября 2027 года.'
+    }]
+  }), [match], 0.22);
+  assert.equal(result.status, 'grounded');
+});
+
+test('grounding parser extracts JSON wrapped in model commentary and repairs trailing commas', () => {
+  const match: RagMatch = {
+    content: 'Пилот начинается 6 сентября 2027 года.',
+    metadata: { source: 'overview.md', title: 'Аврора', section: 'Сроки', chunk_id: 'pilot-1', strategy: 'structural' },
+    embedding: [], token_count: 10, score: 0.9, relevanceScore: 0.9
+  };
+  const raw = [
+    'Вот структурированный ответ:',
+    '{',
+    '  "answer": "Пилот начинается 6 сентября 2027 года.",',
+    '  "citations": [{"chunk_id":"pilot-1","quote":"Пилот начинается 6 сентября 2027 года.",}],',
+    '}',
+    'Надеюсь, это поможет.'
+  ].join('\n');
+  const result = validateGroundedAnswer(raw, [match], 0.22);
+  assert.equal(result.status, 'grounded');
+});
+
+test('malformed model output is retried against the same verified chunks', async () => {
+  const match: RagMatch = {
+    content: 'Пилот начинается 6 сентября 2027 года.',
+    metadata: { source: 'overview.md', title: 'Аврора', section: 'Сроки', chunk_id: 'pilot-1', strategy: 'structural' },
+    embedding: [], token_count: 10, score: 0.9, relevanceScore: 0.9
+  };
+  let retries = 0;
+  const result = await validateGroundedAnswerWithRetry({
+    rawAnswer: 'Ответ модели без JSON',
+    matches: [match],
+    relevanceThreshold: 0.22,
+    retry: async () => {
+      retries += 1;
+      return JSON.stringify({
+        answer: 'Пилот начинается 6 сентября 2027 года.',
+        citations: [{ chunk_id: 'pilot-1', quote: 'Пилот начинается 6 сентября 2027 года.' }]
+      });
+    }
+  });
+  assert.equal(retries, 1);
+  assert.equal(result.status, 'grounded');
+});
+
+test('synthesis mode accepts a derived plan while still requiring exact document citations', () => {
+  const match: RagMatch = {
+    content: 'Контрольная дата промышленного запуска — 17 ноября 2027 года.',
+    metadata: { source: 'overview.md', title: 'Аврора', section: 'Сроки', chunk_id: 'launch-1', strategy: 'structural' },
+    embedding: [], token_count: 9, score: 0.9, relevanceScore: 0.9
+  };
+  const raw = JSON.stringify({
+    answer: 'План: назначить владельцев этапов, провести проверку готовности и завершить подготовку к 17 ноября 2027 года. Первые два пункта — рекомендации, дата запуска — подтверждённый факт.',
+    citations: [{ chunk_id: 'launch-1', quote: 'Контрольная дата промышленного запуска — 17 ноября 2027 года.' }]
+  });
+  assert.equal(validateGroundedAnswer(raw, [match], 0.22).status, 'unknown');
+  assert.equal(validateGroundedAnswer(raw, [match], 0.22, 'synthesis').status, 'grounded');
+
+  const inventedCitation = JSON.stringify({
+    answer: 'План запуска.',
+    citations: [{ chunk_id: 'launch-1', quote: 'Запуск состоится 1 января 2027 года.' }]
+  });
+  assert.equal(validateGroundedAnswer(inventedCitation, [match], 0.22, 'synthesis').status, 'unknown');
 });
 
 test('read-only calendar and planner calls do not bypass RAG grounding', () => {

@@ -36,6 +36,7 @@ test('reflection turns the whole task state into structured working memory', asy
   });
   assert.match(prompt, /Доработать интерфейс/);
   assert.match(prompt, /Спрячь технические настройки/);
+  assert.match(prompt, /модель, провайдера, возможности и ответы самого ассистента/);
   assert.equal(reflection.working.goal, 'Сделать интерфейс удобным');
   assert.equal(reflection.working.stage, 'execution');
   assert.equal(workingSummaryToWrites(reflection.working).length, 9);

@@ -11,7 +11,8 @@ import {
   emptyTaskMemory,
   extractTaskMemoryPatch,
   JsonTaskMemoryStore,
-  mergeTaskMemory
+  mergeTaskMemory,
+  reconcileGroundedOpenQuestions
 } from './task-memory.js';
 
 test('task memory persists atomically and survives a store restart', async () => {
@@ -39,6 +40,22 @@ test('new explicit values replace old values, duplicates merge, and constraints 
   }, 'm2');
   assert.deepEqual(state.clarifiedFacts, [{ key: 'BUDGET', value: '70 млн', sourceMessageId: 'm2' }]);
   assert.deepEqual(state.constraints, []);
+});
+
+test('null-filled optional fields from the model do not erase the established goal', async () => {
+  const current = mergeTaskMemory(emptyTaskMemory('null-safe'), { goal: 'План запуска Авроры' }, 'm1');
+  const patch = await extractTaskMemoryPatch({
+    state: current,
+    userMessage: 'Рассматриваем только 2027 год',
+    complete: async () => JSON.stringify({
+      goal: null,
+      currentStep: null,
+      facts: [{ operation: 'upsert', key: 'year', value: '2027' }]
+    })
+  });
+  const next = mergeTaskMemory(current, patch, 'm2');
+  assert.equal(next.goal, 'План запуска Авроры');
+  assert.equal(next.clarifiedFacts[0]?.value, '2027');
 });
 
 test('different session ids are isolated', async () => {
@@ -69,15 +86,20 @@ test('corrupt JSON is backed up before empty recovery', async () => {
 });
 
 test('extractor accepts strict mocked LLM JSON and rejects invented fields', async () => {
+  let prompt = '';
   const patch = await extractTaskMemoryPatch({
     state: emptyTaskMemory('extract'),
     userMessage: 'Цель — подготовить запуск в 2027 году',
-    complete: async () => JSON.stringify({
-      goal: 'Подготовить запуск',
-      facts: [{ operation: 'upsert', key: 'year', value: '2027' }],
-      secretGuess: 'ignored'
-    })
+    complete: async (messages) => {
+      prompt = messages.map((message) => message.content).join('\n');
+      return JSON.stringify({
+        goal: 'Подготовить запуск',
+        facts: [{ operation: 'upsert', key: 'year', value: '2027' }],
+        secretGuess: 'ignored'
+      });
+    }
   });
+  assert.match(prompt, /Вопросы пользователя к ассистенту сюда не входят/);
   assert.equal(patch.goal, 'Подготовить запуск');
   assert.deepEqual(patch.facts, [{ operation: 'upsert', key: 'year', value: '2027' }]);
   assert.equal('secretGuess' in patch, false);
@@ -90,12 +112,29 @@ test('RAG query prioritizes the question and includes only structured memory', (
     terminology: [{ operation: 'upsert', term: 'запуск', meaning: 'промышленный запуск' }],
     constraints: [{ operation: 'upsert', id: 'budget', value: 'не увеличивать' }]
   }, 'm1');
-  const query = buildTaskMemorySearchQuery('Какие риски у этого варианта?', state);
+  const query = buildTaskMemorySearchQuery('Какие риски у этого варианта?', state, [
+    { role: 'user', content: 'Доступность должна быть не ниже 99,93%.' },
+    { role: 'assistant', content: 'Ответ:\nДа, целевой уровень доступности — 99,93%.\n\nИсточники:\n- operations.md' }
+  ]);
   assert.equal(query.match(/Какие риски у этого варианта\?/g)?.length, 2);
+  assert.equal(query.match(/Доступность должна быть не ниже 99,93%/g)?.length, 2);
+  assert.doesNotMatch(query, /operations\.md/);
   assert.match(query, /Авроры/);
   assert.match(query, /2027/);
   assert.match(query, /промышленный запуск/);
   assert.match(query, /не увеличивать/);
+});
+
+test('a synthesis request carries recent verified dialogue into the RAG query', () => {
+  const query = buildTaskMemorySearchQuery('Составь итоговый план.', emptyTaskMemory('synthesis'), [
+    { role: 'user', content: 'Когда начинается пилот?' },
+    { role: 'assistant', content: 'Ответ:\nПилот начинается 6 сентября 2027 года.\n\nИсточники:\n- overview.md' },
+    { role: 'user', content: 'Какой бюджет?' },
+    { role: 'assistant', content: 'Ответ:\nБюджет — 84,6 млн рублей.\n\nИсточники:\n- budget.md' }
+  ]);
+  assert.match(query, /Пилот начинается 6 сентября 2027 года/);
+  assert.match(query, /Бюджет — 84,6 млн рублей/);
+  assert.doesNotMatch(query, /overview\.md|budget\.md/);
 });
 
 test('agent context orders task memory and RAG before recent history and the current question', async () => {
@@ -103,7 +142,10 @@ test('agent context orders task memory and RAG before recent history and the cur
   const prompts: AgentMessage[][] = [];
   try {
     const conversationStore = new JsonConversationStore(path.join(root, 'conversation.json'));
-    await conversationStore.appendMany([{ role: 'user', content: 'RECENT_HISTORY' }, { role: 'assistant', content: 'OLD_ANSWER' }]);
+    await conversationStore.appendMany([
+      { role: 'user', content: 'RECENT_HISTORY' },
+      { role: 'assistant', content: 'Ответ:\nOLD_ANSWER\n\nИсточники:\n- stale.md — section — stale-chunk\n\nЦитаты:\n- «STALE_QUOTE»' }
+    ]);
     const memoryStore = new JsonAgentMemoryStore(path.join(root, 'working.json'), path.join(root, 'long-term.json'));
     const state = mergeTaskMemory(emptyTaskMemory('context'), { goal: 'TASK_GOAL' }, 'm1');
     const agent = new SimpleAgent({
@@ -123,5 +165,20 @@ test('agent context orders task memory and RAG before recent history and the cur
     assert.ok(contents.findIndex((item) => item.includes('TASK_GOAL')) < contents.indexOf('RAG_CONTEXT'));
     assert.ok(contents.indexOf('RAG_CONTEXT') < contents.indexOf('RECENT_HISTORY'));
     assert.ok(contents.indexOf('RECENT_HISTORY') < contents.indexOf('CURRENT_QUESTION'));
+    assert.ok(contents.includes('OLD_ANSWER'));
+    assert.equal(contents.some((item) => item.includes('stale.md') || item.includes('STALE_QUOTE')), false);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('grounded answers close matching open questions while unknown answers keep them open', () => {
+  const state = mergeTaskMemory(emptyTaskMemory('questions'), {
+    openQuestions: ['Когда начинается пилот?', 'Какой адрес офиса?']
+  }, 'm1');
+  const reconciled = reconcileGroundedOpenQuestions(state, [
+    { role: 'user', content: 'Когда начинается пилот?' },
+    { role: 'assistant', content: '6 сентября 2027 года', grounding: { status: 'grounded' } },
+    { role: 'user', content: 'Какой адрес офиса?' },
+    { role: 'assistant', content: 'Не знаю', grounding: { status: 'unknown' } }
+  ]);
+  assert.deepEqual(reconciled.openQuestions, ['Какой адрес офиса?']);
 });

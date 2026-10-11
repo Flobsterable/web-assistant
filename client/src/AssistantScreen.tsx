@@ -30,10 +30,6 @@ type AgentResponse = {
     result: string;
     isError: boolean;
   }>;
-  ragComparison?: {
-    baseline: string;
-    improved: string;
-  };
   ragMode?: RagMode | null;
   grounding: Grounding;
   taskMemory: TaskMemoryState;
@@ -43,6 +39,7 @@ type Grounding = {
   status: 'grounded' | 'unknown';
   sources: Array<{ source: string; section: string; chunkId: string; relevance: number }>;
   citations: Array<{ chunkId: string; quote: string }>;
+  failureReason?: string;
 };
 
 type TaskMemoryState = {
@@ -57,7 +54,7 @@ type TaskMemoryState = {
   updatedAt: string;
 };
 
-type RagMode = 'baseline' | 'improved' | 'compare';
+type RagMode = 'baseline' | 'improved';
 
 type RagResultSet = {
   query: string;
@@ -96,7 +93,7 @@ type AgentErrorResponse = {
 
 type PublicModelConfig = {
   id: string;
-  provider: 'openai-compatible' | 'gemini';
+  provider: 'openai-compatible' | 'gemini' | 'ollama';
   title: string;
   baseUrl: string;
   model: string;
@@ -431,7 +428,7 @@ function readMemoryToggle(key: string) {
 
 function readRagMode(): RagMode {
   const value = window.localStorage.getItem('rag-mode');
-  return value === 'baseline' || value === 'improved' ? value : 'compare';
+  return value === 'baseline' ? 'baseline' : 'improved';
 }
 
 function getRagDiagnostics(message: ChatMessage): RagDiagnostics | null {
@@ -482,61 +479,29 @@ function RagResultCard({
 }
 
 function RagDiagnosticsPanel({ diagnostics }: { diagnostics: RagDiagnostics }) {
-  const isComparison = diagnostics.mode === 'compare';
-  const baselineContextLabel = isComparison
-    ? 'контекст ответа «Без улучшений»'
-    : diagnostics.active === 'baseline' ? 'использовано для ответа' : 'показано для сравнения';
-  const improvedContextLabel = isComparison
-    ? 'контекст улучшенного ответа'
-    : diagnostics.active === 'improved' ? 'использовано для ответа' : 'показано для сравнения';
+  const activeResult = diagnostics.active === 'baseline' ? diagnostics.baseline : diagnostics.improved;
+  const activeTitle = diagnostics.active === 'baseline' ? 'Без улучшений' : 'Rewrite + фильтр';
 
   return (
-    <details className="rag-diagnostics" open={diagnostics.mode === 'compare'}>
-      <summary>Какие фрагменты документов использованы для ответов</summary>
+    <details className="rag-diagnostics">
+      <summary>Какие фрагменты документов использованы для ответа</summary>
       <p className="rag-explanation">
-        Слева обычный поиск передаёт модели найденные фрагменты без проверки. Справа запрос уточняется,
-        результаты пересортировываются, а фрагменты ниже порога отбрасываются.
+        Показан только выбранный в настройках режим: {activeTitle}.
       </p>
       {diagnostics.rewrittenQuery !== diagnostics.originalQuery && (
         <p className="rag-rewrite"><strong>Запрос после переформулировки:</strong> {diagnostics.rewrittenQuery}</p>
       )}
-      <div className="rag-comparison-grid">
-        <RagResultCard
-          title="Обычный поиск"
-          result={diagnostics.baseline}
-          contextLabel={baselineContextLabel}
-          threshold={diagnostics.config.relevanceThreshold}
-        />
-        <RagResultCard
-          title="Поиск с улучшениями"
-          result={diagnostics.improved}
-          contextLabel={improvedContextLabel}
-          threshold={diagnostics.config.relevanceThreshold}
-        />
-      </div>
+      <RagResultCard
+        title={activeTitle}
+        result={activeResult}
+        contextLabel="использовано для ответа"
+        threshold={diagnostics.config.relevanceThreshold}
+      />
       <footer>
         Настройки: ищем до {diagnostics.config.searchTopK} фрагментов; после фильтра оставляем максимум{' '}
         {diagnostics.config.filteredTopK}; минимальная релевантность — {Math.round(diagnostics.config.relevanceThreshold * 100)}%.
       </footer>
     </details>
-  );
-}
-
-function RagAnswerComparison({ comparison }: { comparison: NonNullable<AgentResponse['ragComparison']> }) {
-  return (
-    <section className="rag-answer-comparison" aria-label="Сравнение ответов RAG">
-      <header><strong>Сравнение ответов</strong><span>Изолированный A/B-тест на одинаковом вопросе</span></header>
-      <div>
-        <article>
-          <h4>Без улучшений</h4>
-          <p>{comparison.baseline}</p>
-        </article>
-        <article className="improved">
-          <h4>Rewrite + фильтр</h4>
-          <p>{comparison.improved}</p>
-        </article>
-      </div>
-    </section>
   );
 }
 
@@ -550,13 +515,13 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     <article className={`message ${message.role}`}>
       <div className="message-label">{isAgent ? 'Агент' : 'Вы'}</div>
       <div className="message-body">
-        {message.meta?.ragComparison ? 'Ниже показаны два независимо сгенерированных ответа на один вопрос.' : message.content}
+        {message.content}
       </div>
       {message.meta && (
         <footer className="message-meta">
           <span>{message.meta.modelTitle}</span>
           <span>{formatDuration(message.meta.elapsedMs)}</span>
-          <span>RAG: {message.meta.ragMode === 'compare' ? 'сравнение · 2 ответа' : message.meta.ragMode === 'improved' ? 'improved · 1 ответ' : message.meta.ragMode === 'baseline' ? 'baseline · 1 ответ' : 'выключен'}</span>
+          <span>RAG: {message.meta.ragMode === 'improved' ? 'rewrite + фильтр' : message.meta.ragMode === 'baseline' ? 'без улучшений' : 'выключен'}</span>
         </footer>
       )}
       {visibleMemoryEvents.length > 0 ? (
@@ -568,7 +533,6 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           ))}
         </footer>
       ) : null}
-      {message.meta?.ragComparison && <RagAnswerComparison comparison={message.meta.ragComparison} />}
       {isAgent && grounding && (
         <details className="grounding-panel" open>
           <summary>
@@ -585,7 +549,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
                 <li key={`${citation.chunkId}-${index}`}>«{citation.quote}» — {citation.chunkId}</li>
               ))}</ul>
             </>
-          ) : <p>Релевантный контекст не прошёл проверку.</p>}
+          ) : <p>Релевантный контекст не прошёл проверку.{grounding.failureReason ? ` Причина: ${grounding.failureReason}.` : ''}</p>}
         </details>
       )}
       {ragDiagnostics && <RagDiagnosticsPanel diagnostics={ragDiagnostics} />}
@@ -795,6 +759,7 @@ export default function AssistantScreen({
         }
         const savedModelId = window.localStorage.getItem('agent-model-id');
         const nextModel = data.models.find((model) => model.id === savedModelId)
+          ?? data.models.find((model) => model.id === 'local')
           ?? data.models.find((model) => model.id === 'flash')
           ?? data.models[0];
         if (nextModel) {
@@ -1527,7 +1492,7 @@ export default function AssistantScreen({
             </div>
 
             <label className="rag-mode-selector">
-              <span><strong>Режим RAG</strong><small>Baseline отключает rewrite и фильтр; сравнение показывает метрики обоих режимов.</small></span>
+              <span><strong>Режим RAG</strong><small>Для каждого запроса используется только выбранный режим.</small></span>
               <select
                 value={ragMode}
                 disabled={!useRag}
@@ -1537,7 +1502,6 @@ export default function AssistantScreen({
                   window.localStorage.setItem('rag-mode', nextMode);
                 }}
               >
-                <option value="compare">Сравнение · 2 ответа</option>
                 <option value="improved">Rewrite + фильтр · 1 ответ</option>
                 <option value="baseline">Без улучшений · 1 ответ</option>
               </select>

@@ -67,19 +67,24 @@ import {
 } from './rag-pipeline.js';
 import {
   createGroundingMessage,
-  createUnknownResult,
   formatGroundedAnswer,
   isPersonalWriteTool,
   toAgentGrounding,
-  validateGroundedAnswer
+  validateGroundedAnswerWithRetry
 } from './grounded-answer.js';
 import {
   buildTaskMemorySearchQuery,
   createTaskMemoryMessage,
   extractTaskMemoryPatch,
   JsonTaskMemoryStore,
+  reconcileGroundedOpenQuestions,
   type TaskMemoryState
 } from './task-memory.js';
+import {
+  classifyResponseMode,
+  requiresDocumentGrounding,
+  type ResponseMode
+} from './response-mode.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -91,11 +96,11 @@ const port = Number(process.env.PORT) || 3001;
 
 type ModelConfig = {
   id: string;
-  provider: 'openai-compatible' | 'gemini';
+  provider: 'openai-compatible' | 'gemini' | 'ollama';
   title: string;
   baseUrl: string;
   model: string;
-  apiKey: string;
+  apiKey: string | null;
   sourceUrl: string | null;
   inputPricePerMillion: number | null;
   outputPricePerMillion: number | null;
@@ -167,7 +172,7 @@ type CompletionResult = {
 
 type ModelResult = CompletionResult & {
   id: string;
-  provider: 'openai-compatible' | 'gemini';
+  provider: 'openai-compatible' | 'gemini' | 'ollama';
   title: string;
   model: string;
   sourceUrl: string | null;
@@ -194,7 +199,7 @@ type AgentRequest = {
   useLongTermMemory: boolean;
   documentNames: string[];
   retrievalStrategy: ChunkingStrategy;
-  ragMode: RagMode;
+  ragMode: Exclude<RagMode, 'compare'>;
 };
 
 type PublicAgentMessage = {
@@ -238,7 +243,7 @@ type PublicResponseTokenMeta = {
   estimatedTotalCost: number | null;
 };
 
-const modelEnvPrefixes = ['MODEL_GEMINI', 'MODEL_FLASH', 'MODEL_PRO'] as const;
+const modelEnvPrefixes = ['MODEL_LOCAL', 'MODEL_GEMINI', 'MODEL_FLASH', 'MODEL_PRO'] as const;
 const agentDefinitionPath = path.resolve(__dirname, '../agents/simple-agent.md');
 const agentDefinition = readAgentDefinition(agentDefinitionPath);
 
@@ -350,7 +355,11 @@ function readModelConfig(
   fallbackTitle: string,
   provider: ModelConfig['provider']
 ): ModelConfig {
-  const sharedApiKey = provider === 'gemini' ? readRequiredGeminiApiKey() : readRequiredSharedApiKey();
+  const sharedApiKey = provider === 'ollama'
+    ? null
+    : provider === 'gemini'
+      ? readRequiredGeminiApiKey()
+      : readRequiredSharedApiKey();
 
   return {
     id: prefix.toLowerCase().replace('model_', ''),
@@ -382,6 +391,7 @@ function readModelConfigs() {
 
 function readAvailableModelConfigs() {
   const definitions: Array<[(typeof modelEnvPrefixes)[number], string, ModelConfig['provider']]> = [
+    ['MODEL_LOCAL', 'Локальная: Ollama', 'ollama'],
     ['MODEL_GEMINI', 'Слабая: Gemini 3.5 Flash-Lite', 'gemini'],
     ['MODEL_FLASH', 'Средняя: DeepSeek V4 Flash', 'openai-compatible'],
     ['MODEL_PRO', 'Сильная: DeepSeek V4 Pro', 'openai-compatible']
@@ -396,7 +406,29 @@ function readAvailableModelConfigs() {
 }
 
 function readAgentModelConfig() {
-  return readModelConfig(agentDefinition.modelEnvPrefix, 'DeepSeek V4 Flash', 'openai-compatible');
+  const availableModels = readAvailableModelConfigs();
+  const configuredId = readOptionalTextEnv('AGENT_MODEL_ID')
+    ?? agentDefinition.modelEnvPrefix.toLowerCase().replace('model_', '');
+  const selected = availableModels.find((model) => model.id === configuredId) ?? availableModels[0];
+  if (!selected) throw new Error('Не настроена ни одна модель. Заполните MODEL_LOCAL_* или ключ облачного провайдера.');
+  return selected;
+}
+
+function createAgentSystemPrompt(model: ModelConfig) {
+  const provider = model.provider === 'ollama'
+    ? 'Ollama, локальный сервер в частной сети'
+    : model.provider === 'gemini'
+      ? 'Google Gemini API'
+      : 'OpenAI-compatible API';
+
+  return [
+    agentDefinition.systemPrompt,
+    '',
+    '## Фактическая конфигурация текущего запуска',
+    `Имя агента: Simple LLM Agent. Провайдер: ${provider}. Модель: ${model.model}. Отображаемое имя: ${model.title}.`,
+    'Если пользователь спрашивает, кто ты, какую модель или провайдер используешь, отвечай строго по этой конфигурации.',
+    'Не выводи свою идентичность из USER_PROFILE, памяти задачи, истории, RAG_CONTEXT или документов и не называй себя облачной моделью, если провайдер указан как локальный Ollama.'
+  ].join('\n');
 }
 
 function readAgentTokenDemoConfig() {
@@ -596,9 +628,7 @@ function readAgentRequest(body: unknown): AgentRequest | string {
     ? candidate.documentNames.map(safeDocumentName).filter((name): name is string => Boolean(name)).slice(0, 10)
     : [];
   const retrievalStrategy: ChunkingStrategy = candidate.retrievalStrategy === 'fixed' ? 'fixed' : 'structural';
-  const ragMode: RagMode = candidate.ragMode === 'baseline' || candidate.ragMode === 'improved'
-    ? candidate.ragMode
-    : 'compare';
+  const ragMode: Exclude<RagMode, 'compare'> = candidate.ragMode === 'baseline' ? 'baseline' : 'improved';
   if (!message) return 'Message is required.';
 
   return { message, sessionId: normalizeSessionId(rawSessionId), profileId, modelId, useRag, useWorkingMemory, useLongTermMemory, documentNames, retrievalStrategy, ragMode };
@@ -617,54 +647,6 @@ function readRagConfig(): RagConfig {
       readOptionalNumberEnv('RAG_RELEVANCE_THRESHOLD') ?? DEFAULT_RAG_CONFIG.relevanceThreshold
     )
   };
-}
-
-const noRelevantContextAnswer = formatGroundedAnswer(createUnknownResult());
-
-async function generateIsolatedRagAnswer(
-  model: ModelConfig,
-  question: string,
-  matches: RagMatch[]
-) {
-  if (matches.length === 0) return noRelevantContextAnswer;
-  const completion = await requestCompletion(model, [
-    createGroundingMessage(matches),
-    { role: 'user', content: question }
-  ], { temperature: 0 });
-  return formatGroundedAnswer(validateGroundedAnswer(completion.answer, matches));
-}
-
-async function createRagAnswerComparison(
-  model: ModelConfig,
-  request: AgentRequest,
-  toolCalls: Array<{ name: string; arguments: Record<string, unknown> }> | undefined
-) {
-  if (!request.useRag || request.ragMode !== 'compare') return undefined;
-  const searchCall = toolCalls?.find((call) => call.name === 'knowledge_search');
-  const rewrittenQuery = typeof searchCall?.arguments.rewrittenQuery === 'string'
-    ? searchCall.arguments.rewrittenQuery
-    : request.message;
-  const index = await loadIndex(documentIndexPath);
-  if (!index || index.document_count === 0) return undefined;
-
-  const retrieval = runRagRetrieval({
-    index,
-    originalQuery: request.message,
-    rewrittenQuery,
-    strategy: request.retrievalStrategy,
-    mode: 'compare',
-    config: readRagConfig(),
-    sourceNames: request.documentNames
-  });
-  const [baseline, improved] = await Promise.all([
-    generateIsolatedRagAnswer(
-      model,
-      request.message,
-      retrieval.baseline.selected.filter((match) => match.relevanceScore >= retrieval.config.relevanceThreshold)
-    ),
-    generateIsolatedRagAnswer(model, request.message, retrieval.improved.selected)
-  ]);
-  return { baseline, improved };
 }
 
 function buildChatCompletionsUrl(baseUrl: string) {
@@ -690,18 +672,22 @@ async function requestOpenAiCompatibleCompletion(
   options?: { temperature?: number }
 ): Promise<CompletionResult> {
   const startedAt = performance.now();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  const body: Record<string, unknown> = {
+    model: config.model,
+    messages,
+    temperature: options?.temperature ?? 0.2
+  };
+  if (config.provider === 'ollama') {
+    body.reasoning_effort = 'none';
+  } else {
+    body.thinking = { type: 'disabled' };
+  }
   const response = await fetch(buildChatCompletionsUrl(config.baseUrl), {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`
-    },
-    body: JSON.stringify({
-      model: config.model,
-      messages,
-      temperature: options?.temperature ?? 0.2,
-      thinking: { type: 'disabled' }
-    })
+    headers,
+    body: JSON.stringify(body)
   });
   const elapsedMs = Math.round(performance.now() - startedAt);
 
@@ -889,6 +875,16 @@ function createTaskMemoryStore(sessionId: string) {
   return new JsonTaskMemoryStore(path.join(taskMemoryPath, `${sessionId}.json`), sessionId);
 }
 
+async function loadReconciledTaskMemory(sessionId: string) {
+  const store = createTaskMemoryStore(sessionId);
+  const [state, history] = await Promise.all([
+    store.load(),
+    createAgentConversationStore(sessionId).load()
+  ]);
+  const reconciled = reconcileGroundedOpenQuestions(state, history);
+  return reconciled === state ? state : store.save(reconciled);
+}
+
 function createAgentMemoryStore(sessionId: string, profileId = defaultProfileId) {
   return new JsonAgentMemoryStore(
     path.join(workingMemoryPath, `${sessionId}.json`),
@@ -942,9 +938,10 @@ function createPublicRequestTokenMeta(
   agentModel: ModelConfig
 ): PublicRequestTokenMeta {
   const tokenBudget = createTokenBudget(agentModel);
-  const selectedHistory = selectMessagesForTokenReport(historyBeforeRequest, requestContent, tokenBudget);
+  const systemPrompt = createAgentSystemPrompt(agentModel);
+  const selectedHistory = selectMessagesForTokenReport(historyBeforeRequest, requestContent, tokenBudget, systemPrompt);
   const report = createTokenReport({
-    systemPrompt: agentDefinition.systemPrompt,
+    systemPrompt,
     selectedHistory,
     fullHistory: historyBeforeRequest,
     currentRequest: requestContent,
@@ -990,7 +987,8 @@ function createPublicResponseTokenMeta(
 function selectMessagesForTokenReport(
   historyBeforeRequest: Awaited<ReturnType<SimpleAgent['history']>>,
   requestContent: string,
-  tokenBudget: ReturnType<typeof createTokenBudget>
+  tokenBudget: ReturnType<typeof createTokenBudget>,
+  systemPrompt: string
 ) {
   const maxContextMessages = readOptionalNumberEnv('AGENT_MAX_CONTEXT_MESSAGES') ?? 40;
   const maxContextCharacters = readOptionalNumberEnv('AGENT_MAX_CONTEXT_CHARACTERS') ?? 24_000;
@@ -999,7 +997,7 @@ function selectMessagesForTokenReport(
   const maxInputTokens = Math.max(0, tokenBudget.maxContextTokens - tokenBudget.reservedOutputTokens);
   let characterCount = requestContent.length;
   let tokenCount =
-    estimateMessageTokens({ role: 'system', content: agentDefinition.systemPrompt }) +
+    estimateMessageTokens({ role: 'system', content: systemPrompt }) +
     estimateMessageTokens({ role: 'user', content: requestContent });
 
   for (const message of [...recentMessages].reverse()) {
@@ -1110,11 +1108,14 @@ function createAgent(
   attachedDocumentNames: string[] = [],
   retrievalStrategy: ChunkingStrategy = 'structural',
   useRag = true,
-  ragMode: RagMode = 'compare',
-  taskMemory?: TaskMemoryState
+  ragMode: Exclude<RagMode, 'compare'> = 'improved',
+  taskMemory?: TaskMemoryState,
+  ragHistory: Array<{ role: 'user' | 'assistant'; content: string }> = []
 ) {
   const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   let activeRagMatches: RagMatch[] | null = null;
+  let activeRagRequest: string | null = null;
+  let activeResponseMode: ResponseMode = 'factual';
   const mcpRuntime = new McpAgentRuntime(
     new ProfileScopedMcpToolClient(
       new CombinedMcpToolClient([
@@ -1127,8 +1128,8 @@ function createAgent(
   );
   return new SimpleAgent({
     name: 'Simple LLM Agent',
-    provider: agentDefinition.provider,
-    systemPrompt: agentDefinition.systemPrompt,
+    provider: agentModel.provider,
+    systemPrompt: createAgentSystemPrompt(agentModel),
     temperature: agentDefinition.temperature,
     modelTitle: agentModel.title,
     model: agentModel.model,
@@ -1159,15 +1160,34 @@ function createAgent(
     useLongTermMemory: memoryUsage?.longTerm ?? true,
     taskMemoryMessage: taskMemory ? createTaskMemoryMessage(taskMemory) : undefined,
     complete: (messages, options) => requestCompletion(agentModel, messages, options),
-    transformAnswer: ({ answer, toolCalls }) => {
+    transformAnswer: async ({ answer, userRequest, toolCalls }) => {
       const usedKnowledgeSearch = toolCalls.some((call) => call.name === 'knowledge_search' && !call.isError);
       if (!useRag || !usedKnowledgeSearch || activeRagMatches === null) return { answer };
-      const result = validateGroundedAnswer(answer, activeRagMatches, readRagConfig().relevanceThreshold);
-      return { answer: formatGroundedAnswer(result), grounding: toAgentGrounding(result, activeRagMatches) };
+      const ragMatches = activeRagMatches;
+      const result = await validateGroundedAnswerWithRetry({
+        rawAnswer: answer,
+        matches: ragMatches,
+        relevanceThreshold: readRagConfig().relevanceThreshold,
+        responseMode: activeResponseMode,
+        retry: async () => {
+          if (ragMatches.length === 0) return '{"answer":"","citations":[]}';
+          return (await requestCompletion(agentModel, [
+            createGroundingMessage(ragMatches, activeResponseMode),
+            {
+              role: 'system',
+              content: 'Предыдущая попытка нарушила JSON-контракт. Верни ровно один JSON-объект без пояснений, markdown и текста до или после него.'
+            },
+            { role: 'user', content: activeRagRequest ?? userRequest }
+          ], { temperature: 0 })).answer;
+        }
+      });
+      return { answer: formatGroundedAnswer(result), grounding: toAgentGrounding(result, ragMatches) };
     },
     toolRuntime: {
       async resolve(userRequest) {
         activeRagMatches = null;
+        activeRagRequest = null;
+        activeResponseMode = classifyResponseMode(userRequest);
         if (!useRag) return mcpRuntime.resolve(userRequest);
 
         const [mcp, index] = await Promise.all([
@@ -1176,14 +1196,16 @@ function createAgent(
         ]);
         const performedPersonalWrite = mcp.calls.some((call) => !call.isError && isPersonalWriteTool(call.name));
         if (performedPersonalWrite) return mcp;
+        const documentsRequired = requiresDocumentGrounding(userRequest, attachedDocumentNames.length > 0);
         if (!index || index.document_count === 0) {
-          activeRagMatches = [];
           const ragCall = {
             name: 'knowledge_search',
             arguments: { query: userRequest, rewrittenQuery: userRequest, strategy: retrievalStrategy, mode: ragMode },
             result: JSON.stringify({ error: 'empty_index', selectedCount: 0 }),
             isError: false
           };
+          if (!documentsRequired) return { contextMessages: mcp.contextMessages, calls: [...mcp.calls, ragCall] };
+          activeRagMatches = [];
           return {
             contextMessages: [...mcp.contextMessages, {
               role: 'system' as const,
@@ -1193,35 +1215,45 @@ function createAgent(
           };
         }
 
-        const memoryQuery = taskMemory ? buildTaskMemorySearchQuery(userRequest, taskMemory) : userRequest;
+        const memoryQuery = taskMemory ? buildTaskMemorySearchQuery(userRequest, taskMemory, ragHistory) : userRequest;
+        activeRagRequest = memoryQuery;
         let rewrittenQuery = memoryQuery;
         if (ragMode !== 'baseline') {
           try {
-            rewrittenQuery = (await requestCompletion(agentModel, [
+            const modelRewrite = (await requestCompletion(agentModel, [
               {
                 role: 'system',
                 content: 'Перепиши вопрос в один короткий самодостаточный поисковый запрос. Сохрани язык, имена, даты, коды и исходный смысл. Не отвечай на вопрос и не добавляй пояснений.'
               },
               { role: 'user', content: memoryQuery }
-            ], { temperature: 0 })).answer.replace(/^['"«]|['"»]$/g, '').trim() || memoryQuery;
+            ], { temperature: 0 })).answer.replace(/^['"«]|['"»]$/g, '').trim();
+            rewrittenQuery = modelRewrite && modelRewrite !== memoryQuery
+              ? `${modelRewrite}\n${memoryQuery}`
+              : memoryQuery;
           } catch (error) {
             console.warn('RAG query rewrite failed; using the original query.', error);
           }
         }
 
+        const baseRagConfig = readRagConfig();
         const retrieval = runRagRetrieval({
           index,
           originalQuery: ragMode === 'baseline' ? memoryQuery : userRequest,
           rewrittenQuery,
           strategy: retrievalStrategy,
           mode: ragMode,
-          config: readRagConfig(),
+          config: activeResponseMode === 'synthesis'
+            ? {
+                ...baseRagConfig,
+                searchTopK: Math.max(baseRagConfig.searchTopK, 12),
+                filteredTopK: Math.max(baseRagConfig.filteredTopK, 8)
+              }
+            : baseRagConfig,
           sourceNames: attachedDocumentNames
         });
         const matches = retrieval.active.selected.filter(
           (match) => match.relevanceScore >= retrieval.config.relevanceThreshold
         );
-        activeRagMatches = matches;
         const diagnostics = publicRagDiagnostics(retrieval);
         const ragCall = {
           name: 'knowledge_search',
@@ -1240,6 +1272,10 @@ function createAgent(
         };
 
         if (matches.length === 0) {
+          if (!documentsRequired) {
+            return { contextMessages: mcp.contextMessages, calls: [...mcp.calls, ragCall] };
+          }
+          activeRagMatches = [];
           return {
             contextMessages: [...mcp.contextMessages, {
               role: 'system' as const,
@@ -1249,7 +1285,8 @@ function createAgent(
           };
         }
 
-        const knowledgeContext = createGroundingMessage(matches);
+        activeRagMatches = matches;
+        const knowledgeContext = createGroundingMessage(matches, activeResponseMode);
         return {
           contextMessages: [...mcp.contextMessages, knowledgeContext],
           calls: [...mcp.calls, ragCall]
@@ -1267,7 +1304,35 @@ app.get('/api/config', (_req: Request, res: Response) => {
       hasApiKey: true
     });
   }
-  return res.json({ models: [], hasApiKey: false, error: 'Не настроен API-ключ ни для одной модели.' });
+  return res.json({ models: [], hasApiKey: false, error: 'Не настроена ни одна модель.' });
+});
+
+app.get('/api/ollama/status', async (_req: Request, res: Response) => {
+  const model = readAvailableModelConfigs().find((candidate) => candidate.provider === 'ollama');
+  if (!model) {
+    return res.status(503).json({ online: false, error: 'MODEL_LOCAL_BASE_URL и MODEL_LOCAL_NAME не настроены.' });
+  }
+
+  try {
+    const response = await fetch(`${model.baseUrl}/models`, { signal: AbortSignal.timeout(5_000) });
+    const data = await response.json() as { data?: Array<{ id?: string }>; error?: { message?: string } };
+    if (!response.ok) throw new Error(data.error?.message ?? `Ollama вернула HTTP ${response.status}.`);
+    const models = (data.data ?? []).flatMap((item) => typeof item.id === 'string' ? [item.id] : []);
+    return res.json({
+      online: true,
+      baseUrl: model.baseUrl,
+      configuredModel: model.model,
+      modelAvailable: models.includes(model.model),
+      models
+    });
+  } catch (error) {
+    return res.status(502).json({
+      online: false,
+      baseUrl: model.baseUrl,
+      configuredModel: model.model,
+      error: error instanceof Error ? error.message : 'Не удалось подключиться к Ollama.'
+    });
+  }
 });
 
 app.post('/mcp/google-calendar', async (req: Request, res: Response) => {
@@ -1383,7 +1448,7 @@ app.get('/api/agent/history', async (req: Request, res: Response) => {
 app.get('/api/agent/task-memory', async (req: Request, res: Response) => {
   try {
     const sessionId = readSessionIdFromRequest(req);
-    return res.json(await createTaskMemoryStore(sessionId).load());
+    return res.json(await loadReconciledTaskMemory(sessionId));
   } catch (error) {
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load task memory.' });
   }
@@ -1859,7 +1924,8 @@ app.post('/api/agent', async (req: Request, res: Response) => {
   }
 
   const availableModels = readAvailableModelConfigs();
-  const defaultModelId = agentDefinition.modelEnvPrefix.toLowerCase().replace('model_', '');
+  const defaultModelId = readOptionalTextEnv('AGENT_MODEL_ID')
+    ?? agentDefinition.modelEnvPrefix.toLowerCase().replace('model_', '');
   const agentModel = request.modelId
     ? availableModels.find((model) => model.id === request.modelId)
     : availableModels.find((model) => model.id === defaultModelId) ?? availableModels[0];
@@ -1885,19 +1951,20 @@ app.post('/api/agent', async (req: Request, res: Response) => {
         state: taskMemory,
         userMessage: request.message,
         complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
-      }), { provider: agentDefinition.provider, model: agentModel.model });
+      }), { provider: agentModel.provider, model: agentModel.model });
       taskMemory = await logger.step('task_memory_persist', () => taskMemoryStore.update(patch, userMessageId));
     } catch (error) {
       console.warn('Task memory update failed; continuing with the last valid state.', error);
     }
+    const historyForRag = await createAgentConversationStore(sessionId).load();
     const agent = createAgent(agentModel, sessionId, {
       working: request.useWorkingMemory,
       longTerm: request.useLongTermMemory
-    }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag, request.ragMode, taskMemory);
+    }, userProfile, request.documentNames, request.retrievalStrategy, request.useRag, request.ragMode, taskMemory, historyForRag);
     const taskStore = createTaskStateStore(request.profileId);
     let [memoryBeforeTaskCommand, historyBeforeTaskCommand, savedTasks] = await Promise.all([
       createAgentMemoryStore(sessionId, request.profileId).load(),
-      createAgentConversationStore(sessionId).load(),
+      Promise.resolve(historyForRag),
       taskStore.list()
     ]);
     const sessionHasActiveTask = savedTasks.some((task) => task.status === 'active' && task.activeSessionId === sessionId);
@@ -1913,7 +1980,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
         recentHistory: historyBeforeTaskCommand.map(({ role, content }) => ({ role, content })),
         savedTasks,
         complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
-      }), { provider: agentDefinition.provider, model: agentModel.model });
+      }), { provider: agentModel.provider, model: agentModel.model });
     } catch {
       taskCommand = detectTaskCommand(request.message);
     }
@@ -1937,10 +2004,9 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     const loadedMemory = await logger.step('memory_load', () => createAgentMemoryStore(sessionId, request.profileId).load());
     await logger.step('context_assembly', async () => { await agent.inspectNextRun(request.message); });
     const result = await logger.step('provider_request', () => agent.run(request.message, { userMessageId }), {
-      provider: agentDefinition.provider,
+      provider: agentModel.provider,
       model: agentModel.model
     });
-    const ragComparisonPromise = createRagAnswerComparison(agentModel, request, result.toolCalls);
     await logger.step('invariant_check', async () => result.invariantCompliance ?? null, {
       invariantCompliance: result.invariantCompliance
     });
@@ -1950,6 +2016,10 @@ app.post('/api/agent', async (req: Request, res: Response) => {
     });
     await logger.step('conversation_persist', async () => undefined);
     const history = await agent.history();
+    const reconciledTaskMemory = reconcileGroundedOpenQuestions(taskMemory, history);
+    if (reconciledTaskMemory !== taskMemory) {
+      taskMemory = await logger.step('task_memory_reconcile', () => taskMemoryStore.save(reconciledTaskMemory));
+    }
     let reflection: Awaited<ReturnType<typeof reflectConversationMemory>> | null = null;
     let requestedTaskPhase: TaskPhase | null = null;
     try {
@@ -1959,7 +2029,7 @@ app.post('/api/agent', async (req: Request, res: Response) => {
         userMessage: request.message,
         assistantAnswer: result.answer,
         complete: async (messages) => (await requestCompletion(agentModel, messages, { temperature: 0 })).answer
-      }), { provider: agentDefinition.provider, model: agentModel.model });
+      }), { provider: agentModel.provider, model: agentModel.model });
     } catch {
       reflection = null;
     }
@@ -2048,13 +2118,11 @@ app.post('/api/agent', async (req: Request, res: Response) => {
       }
     }
     const memoryEvents = workingEvent ? [workingEvent, ...policyEvents] : policyEvents;
-    const ragComparison = await ragComparisonPromise;
     return res.json({
       ...result,
       taskMemory,
       grounding: result.grounding ?? { status: 'unknown', sources: [], citations: [] },
       ragMode: request.useRag ? request.ragMode : null,
-      ...(ragComparison ? { ragComparison } : {}),
       turnId: logger.turnId,
       memoryReflection: reflection,
       memoryEvents,

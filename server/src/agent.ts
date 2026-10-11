@@ -32,6 +32,7 @@ export type AgentGrounding = {
   status: 'grounded' | 'unknown';
   sources: Array<{ source: string; section: string; chunkId: string; relevance: number }>;
   citations: Array<{ chunkId: string; quote: string }>;
+  failureReason?: string;
 };
 
 export type StoredAgentMessage = {
@@ -781,8 +782,13 @@ function memoryIdsPresentInContext(context: AgentMessage[], entries: MemoryEntry
 function toAgentMessage(message: StoredAgentMessage): AgentMessage {
   return {
     role: message.role,
-    content: message.content
+    content: message.role === 'assistant' ? answerTextOnly(message.content) : message.content
   };
+}
+
+function answerTextOnly(content: string) {
+  if (!content.startsWith('Ответ:\n')) return content;
+  return content.slice('Ответ:\n'.length).split('\n\nИсточники:\n', 1)[0]?.trim() || content;
 }
 
 export function createMemoryMessages(layer: 'working' | 'long-term', entries: MemoryEntry[]): AgentMessage[] {

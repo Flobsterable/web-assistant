@@ -4,8 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { validateGroundedAnswer } from './grounded-answer.js';
-import { buildIndex, type IndexedChunk } from './indexer.js';
-import type { RagMatch } from './rag-pipeline.js';
+import { buildIndex, type DocumentIndex, type IndexedChunk } from './indexer.js';
+import { DEFAULT_RAG_CONFIG, runRagRetrieval, type RagMatch } from './rag-pipeline.js';
+import { classifyResponseMode } from './response-mode.js';
 import { buildTaskMemorySearchQuery, emptyTaskMemory, extractTaskMemoryPatch, mergeTaskMemory, type TaskMemoryPatch } from './task-memory.js';
 
 type Evidence = { source: string; quote: string };
@@ -20,7 +21,7 @@ const recovery = 'Параметры восстановления: **RTO — 45 
 const availability = 'Целевой уровень доступности промышленной системы — **99,93% в месяц**.';
 const sev = 'Основной канал координации инцидентов — **#aurora-war-room**. Первичным дежурным является команда Platform North. При инциденте уровня SEV-1 технический руководитель Илья Ветров должен быть уведомлён не позднее чем через 10 минут после регистрации.';
 
-async function withIndex(run: (chunks: IndexedChunk[]) => Promise<void>) {
+async function withIndex(run: (chunks: IndexedChunk[], index: DocumentIndex) => Promise<void>) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'task-memory-scenario-'));
   const documents = path.join(root, 'documents');
   try {
@@ -29,7 +30,7 @@ async function withIndex(run: (chunks: IndexedChunk[]) => Promise<void>) {
     const names = ['01-aurora-overview.md', '02-aurora-architecture.md', '03-aurora-budget.md', '04-aurora-operations.md'];
     await Promise.all(names.map((name) => copyFile(path.join(fixtures, name), path.join(documents, name))));
     const index = await buildIndex(documents, path.join(root, 'index.json'));
-    await run(index.chunks.filter((chunk) => chunk.metadata.strategy === 'structural'));
+    await run(index.chunks.filter((chunk) => chunk.metadata.strategy === 'structural'), index);
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
@@ -122,4 +123,65 @@ test('12-turn budget and operations scenario resolves pronoun through memory and
   assert.match(pronounQuery, /проектного комитета/);
   assert.match(pronounQuery, /Platform North/);
   assert.equal(groundedAnswers, 8);
+}));
+
+test('budget and operations follow-ups retrieve the right evidence and switch the final recommendation to synthesis', async () => withIndex(async (_chunks, index) => {
+  let state = emptyTaskMemory('budget-retrieval');
+  state = mergeTaskMemory(state, { goal: 'Подготовить решение проектного комитета по бюджету и эксплуатации Авроры' }, 'm1');
+  state = mergeTaskMemory(state, {
+    constraints: [{ operation: 'upsert', id: 'budget-policy', value: 'Увеличивать бюджет запрещено' }]
+  }, 'm4');
+  state = mergeTaskMemory(state, {
+    facts: [{ operation: 'upsert', key: 'operations-owner', value: 'Platform North' }]
+  }, 'm9');
+  state = mergeTaskMemory(state, {
+    constraints: [{ operation: 'upsert', id: 'budget-policy', value: 'Увеличение допустимо максимум на размер резерва' }]
+  }, 'm10');
+
+  const history: Array<{ role: 'user' | 'assistant'; content: string }> = [
+    { role: 'user', content: 'Каков резерв?' },
+    { role: 'assistant', content: 'Ответ:\nУправленческий резерв составляет 7,2 млн рублей.' },
+    { role: 'user', content: 'Кто согласует резерв?' },
+    { role: 'assistant', content: 'Ответ:\nРезерв совместно согласуют Марина Соколова и Антон Беляев.' },
+    { role: 'user', content: 'Какой RTO?' },
+    { role: 'assistant', content: 'Ответ:\nRTO составляет 45 минут.' },
+    { role: 'user', content: 'Какой RPO?' },
+    { role: 'assistant', content: 'Ответ:\nRPO составляет 12 минут.' },
+    { role: 'user', content: 'Что предусмотрено для SEV-1?' },
+    { role: 'assistant', content: 'Ответ:\nПервичный дежурный — Platform North; Илью Ветрова уведомляют не позднее чем через 10 минут.' },
+    { role: 'user', content: 'Изменение: бюджет можно увеличить максимум на размер резерва.' },
+    { role: 'assistant', content: 'Ответ:\nПринято как требование пользователя.' }
+  ];
+
+  const followUp = 'Какие эксплуатационные параметры у этого варианта?';
+  const followUpQuery = buildTaskMemorySearchQuery(followUp, state, history);
+  const followUpRetrieval = runRagRetrieval({
+    index,
+    originalQuery: followUp,
+    rewrittenQuery: followUpQuery,
+    strategy: 'structural',
+    mode: 'improved',
+    config: DEFAULT_RAG_CONFIG
+  });
+  assert.equal(classifyResponseMode(followUp), 'factual');
+  assert.ok(followUpRetrieval.improved.selected.some((match) => match.metadata.source === '04-aurora-operations.md'));
+
+  history.push(
+    { role: 'user', content: followUp },
+    { role: 'assistant', content: 'Ответ:\nRTO — 45 минут, RPO — 12 минут, доступность — 99,93% в месяц.' }
+  );
+  const recommendation = 'Дай итоговую рекомендацию проектному комитету.';
+  const recommendationQuery = buildTaskMemorySearchQuery(recommendation, state, history);
+  const recommendationRetrieval = runRagRetrieval({
+    index,
+    originalQuery: recommendation,
+    rewrittenQuery: recommendationQuery,
+    strategy: 'structural',
+    mode: 'improved',
+    config: { ...DEFAULT_RAG_CONFIG, searchTopK: 12, filteredTopK: 8 }
+  });
+  const sources = new Set(recommendationRetrieval.improved.selected.map((match) => match.metadata.source));
+  assert.equal(classifyResponseMode(recommendation), 'synthesis');
+  assert.ok(sources.has('03-aurora-budget.md'));
+  assert.ok(sources.has('04-aurora-operations.md'));
 }));
