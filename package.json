@@ -6,6 +6,7 @@
     "index": "npm run index --workspace server",
     "index:aurora": "npm run index:aurora --workspace server",
     "evaluate:rag": "npm run evaluate:rag --workspace server",
+    "evaluate:local-llm": "npm run evaluate:local-llm --workspace server",
     "build": "npm run build --workspace server && npm run build --workspace client",
     "test": "npm run test --workspace server",
     "start": "npm run start --workspace server"

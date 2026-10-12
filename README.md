@@ -119,8 +119,13 @@ MODEL_LOCAL_BASE_URL=http://192.168.1.50:11434/v1
 MODEL_LOCAL_NAME=qwen3.5:9b
 MODEL_LOCAL_INPUT_PRICE_PER_1M=0
 MODEL_LOCAL_OUTPUT_PRICE_PER_1M=0
-MODEL_LOCAL_MAX_CONTEXT_TOKENS=16000
-MODEL_LOCAL_RESERVED_OUTPUT_TOKENS=1200
+MODEL_LOCAL_MAX_CONTEXT_TOKENS=8192
+MODEL_LOCAL_RESERVED_OUTPUT_TOKENS=600
+MODEL_LOCAL_TEMPERATURE=0.1
+MODEL_LOCAL_CONTEXT_WINDOW=8192
+MODEL_LOCAL_MAX_OUTPUT_TOKENS=600
+MODEL_LOCAL_TOP_P=0.9
+MODEL_LOCAL_SEED=42
 ```
 
 Замените `192.168.1.50` на адрес Windows-компьютера. Не пробрасывайте порт `11434` в интернет. После запуска проекта проверьте соединение:
@@ -130,6 +135,37 @@ curl http://localhost:3001/api/ollama/status
 ```
 
 Ответ должен содержать `"online":true` и `"modelAvailable":true`. В настройках агента появятся обе модели: локальная Ollama и DeepSeek.
+
+`MODEL_LOCAL_MAX_CONTEXT_TOKENS` задаёт бюджет контекста на стороне агента. `MODEL_LOCAL_CONTEXT_WINDOW` передаётся самой Ollama как `num_ctx`, а `MODEL_LOCAL_MAX_OUTPUT_TOKENS` — как `num_predict`. Локальная модель вызывается через нативный `/api/chat`, поэтому приложение получает фактическое число токенов и длительности генерации от Ollama.
+
+### Benchmark и квантование локальной модели
+
+Для сравнения одной модели до и после оптимизации задайте два профиля. Теги должны уже существовать в Ollama; доступные варианты проверьте командой `ollama list` на компьютере с моделью:
+
+```dotenv
+MODEL_LOCAL_BASELINE_NAME=qwen3.5:9b
+MODEL_LOCAL_BASELINE_TEMPERATURE=0.2
+# num_ctx, num_predict, top_p и seed не задаются:
+# профиль «до» воспроизводит прежние настройки Ollama по умолчанию.
+
+MODEL_LOCAL_OPTIMIZED_NAME=qwen3.5:9b
+MODEL_LOCAL_OPTIMIZED_TEMPERATURE=0.1
+MODEL_LOCAL_OPTIMIZED_CONTEXT_WINDOW=8192
+MODEL_LOCAL_OPTIMIZED_MAX_OUTPUT_TOKENS=600
+MODEL_LOCAL_OPTIMIZED_TOP_P=0.9
+MODEL_LOCAL_OPTIMIZED_SEED=42
+LOCAL_LLM_BENCHMARK_REPETITIONS=3
+```
+
+Чтобы измерить эффект квантования, укажите в `MODEL_LOCAL_BASELINE_NAME` и `MODEL_LOCAL_OPTIMIZED_NAME` разные установленные теги одной модели. Конкретные имена зависят от опубликованных вариантов модели; benchmark прочитает реальный `quantization_level` через Ollama `/api/show`, не пытаясь определить его по имени.
+
+Запуск:
+
+```bash
+npm run evaluate:local-llm
+```
+
+Команда сравнивает исходный вариант (старый общий prompt, `temperature=0.2`, остальные параметры генерации по умолчанию Ollama) с оптимизированным вариантом (специализированный RAG-prompt, `temperature=0.1`, `num_ctx=8192`, `num_predict=600`, `top_p=0.9`, фиксированный seed). Каждый профиль прогревается, затем трижды выполняет 11 контрольных вопросов корпуса «Аврора». Отчёты сохраняются в `server/data/benchmarks/local-llm-latest.md` и `.json` и содержат общие показатели и качество по каждому вопросу, median/p95, токены в секунду, размер модели и VRAM из `/api/ps`. Допустимый порог — потеря качества не более 3 процентных пунктов.
 
 `npm run index:aurora` копирует четыре подготовленных документа из `rag-test-data` в локальное хранилище и строит индекс. Контрольные вопросы и ожидаемые ответы находятся в `rag-test-data/control-questions.md`.
 
@@ -162,6 +198,7 @@ RAG_RELEVANCE_THRESHOLD=0.22
 npm run index   # собрать локальный индекс без запуска web-сервера
 npm run index:aurora # загрузить тестовый корпус «Аврора» и построить индекс
 npm run evaluate:rag # сравнить baseline и improved по retrieval-метрикам
+npm run evaluate:local-llm # сравнить локальную LLM до и после оптимизации
 npm test        # unit- и integration-тесты, включая RAG pipeline
 npm run build   # проверить TypeScript и production-сборку
 npm start       # запустить собранный Express-сервер

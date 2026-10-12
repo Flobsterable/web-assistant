@@ -86,6 +86,7 @@ import {
   requiresDocumentGrounding,
   type ResponseMode
 } from './response-mode.js';
+import { requestOllamaCompletion } from './ollama-client.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -108,6 +109,11 @@ type ModelConfig = {
   priceCurrency: string;
   maxContextTokens: number;
   reservedOutputTokens: number;
+  temperature: number;
+  contextWindow: number;
+  maxOutputTokens: number;
+  topP: number | null;
+  seed: number | null;
 };
 
 type AgentDefinition = {
@@ -362,6 +368,13 @@ function readModelConfig(
       ? readRequiredGeminiApiKey()
       : readRequiredSharedApiKey();
 
+  const maxContextTokens =
+    readOptionalNumberEnv(`${prefix}_MAX_CONTEXT_TOKENS`) ?? readOptionalNumberEnv('MODEL_MAX_CONTEXT_TOKENS') ?? agentDefinition.maxContextTokens;
+  const reservedOutputTokens =
+    readOptionalNumberEnv(`${prefix}_RESERVED_OUTPUT_TOKENS`) ??
+    readOptionalNumberEnv('MODEL_RESERVED_OUTPUT_TOKENS') ??
+    agentDefinition.reservedOutputTokens;
+
   return {
     id: prefix.toLowerCase().replace('model_', ''),
     provider,
@@ -373,12 +386,13 @@ function readModelConfig(
     inputPricePerMillion: readOptionalNumberEnv(`${prefix}_INPUT_PRICE_PER_1M`),
     outputPricePerMillion: readOptionalNumberEnv(`${prefix}_OUTPUT_PRICE_PER_1M`),
     priceCurrency: readOptionalTextEnv(`${prefix}_PRICE_CURRENCY`) ?? readOptionalTextEnv('PRICE_CURRENCY') ?? 'USD',
-    maxContextTokens:
-      readOptionalNumberEnv(`${prefix}_MAX_CONTEXT_TOKENS`) ?? readOptionalNumberEnv('MODEL_MAX_CONTEXT_TOKENS') ?? agentDefinition.maxContextTokens,
-    reservedOutputTokens:
-      readOptionalNumberEnv(`${prefix}_RESERVED_OUTPUT_TOKENS`) ??
-      readOptionalNumberEnv('MODEL_RESERVED_OUTPUT_TOKENS') ??
-      agentDefinition.reservedOutputTokens
+    maxContextTokens,
+    reservedOutputTokens,
+    temperature: readOptionalNumberEnv(`${prefix}_TEMPERATURE`) ?? agentDefinition.temperature,
+    contextWindow: readOptionalNumberEnv(`${prefix}_CONTEXT_WINDOW`) ?? maxContextTokens,
+    maxOutputTokens: readOptionalNumberEnv(`${prefix}_MAX_OUTPUT_TOKENS`) ?? reservedOutputTokens,
+    topP: readOptionalNumberEnv(`${prefix}_TOP_P`),
+    seed: readOptionalNumberEnv(`${prefix}_SEED`)
   };
 }
 
@@ -422,8 +436,18 @@ function createAgentSystemPrompt(model: ModelConfig) {
       ? 'Google Gemini API'
       : 'OpenAI-compatible API';
 
+  const localOptimization = model.provider === 'ollama'
+    ? [
+        '',
+        '## Профиль локальной модели',
+        'Отвечай компактно: сначала прямой результат, затем только необходимые пояснения.',
+        'При наличии RAG_CONTEXT строго соблюдай его JSON-контракт, точно сохраняй имена, даты, числа и chunk_id и не дополняй документальные факты знаниями модели.'
+      ]
+    : [];
+
   return [
     agentDefinition.systemPrompt,
+    ...localOptimization,
     '',
     '## Фактическая конфигурация текущего запуска',
     `Имя агента: Simple LLM Agent. Провайдер: ${provider}. Модель: ${model.model}. Отображаемое имя: ${model.title}.`,
@@ -664,6 +688,33 @@ async function requestCompletion(
     return requestGeminiCompletion(config, messages, options);
   }
 
+  if (config.provider === 'ollama') {
+    const result = await requestOllamaCompletion({
+      baseUrl: config.baseUrl,
+      model: config.model,
+      messages,
+      json: options?.json,
+      settings: {
+        temperature: options?.temperature ?? config.temperature,
+        contextWindow: config.contextWindow,
+        maxOutputTokens: config.maxOutputTokens,
+        topP: config.topP,
+        seed: config.seed
+      }
+    });
+    return {
+      answer: result.answer,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      totalTokens: result.totalTokens,
+      tokenSource: 'api',
+      cost: calculateCost(result.inputTokens, result.outputTokens, config),
+      priceCurrency: config.priceCurrency,
+      elapsedMs: result.wallTimeMs,
+      finishReason: result.finishReason
+    };
+  }
+
   return requestOpenAiCompatibleCompletion(config, messages, options);
 }
 
@@ -678,13 +729,12 @@ async function requestOpenAiCompatibleCompletion(
   const body: Record<string, unknown> = {
     model: config.model,
     messages,
-    temperature: options?.temperature ?? 0.2
+    temperature: options?.temperature ?? config.temperature,
+    max_tokens: config.maxOutputTokens,
+    ...(config.topP === null ? {} : { top_p: config.topP }),
+    ...(config.seed === null ? {} : { seed: config.seed })
   };
-  if (config.provider === 'ollama') {
-    body.reasoning_effort = 'none';
-  } else {
-    body.thinking = { type: 'disabled' };
-  }
+  body.thinking = { type: 'disabled' };
   if (options?.json) {
     body.response_format = { type: 'json_object' };
   }
@@ -749,7 +799,9 @@ async function requestGeminiCompletion(
         }
       ],
       generationConfig: {
-        temperature: options?.temperature ?? 0.2,
+        temperature: options?.temperature ?? config.temperature,
+        maxOutputTokens: config.maxOutputTokens,
+        ...(config.topP === null ? {} : { topP: config.topP }),
         ...(options?.json ? { responseMimeType: 'application/json' } : {})
       }
     })
@@ -813,7 +865,12 @@ function toPublicModelConfig(config: ModelConfig) {
     outputPricePerMillion: config.outputPricePerMillion,
     priceCurrency: config.priceCurrency,
     maxContextTokens: config.maxContextTokens,
-    reservedOutputTokens: config.reservedOutputTokens
+    reservedOutputTokens: config.reservedOutputTokens,
+    temperature: config.temperature,
+    contextWindow: config.contextWindow,
+    maxOutputTokens: config.maxOutputTokens,
+    topP: config.topP,
+    seed: config.seed
   };
 }
 
@@ -1135,7 +1192,7 @@ function createAgent(
     name: 'Simple LLM Agent',
     provider: agentModel.provider,
     systemPrompt: createAgentSystemPrompt(agentModel),
-    temperature: agentDefinition.temperature,
+    temperature: agentModel.temperature,
     modelTitle: agentModel.title,
     model: agentModel.model,
     conversationStore: createAgentConversationStore(sessionId),
