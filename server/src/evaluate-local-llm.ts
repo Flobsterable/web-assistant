@@ -159,6 +159,7 @@ function profileSummary(profile: BenchmarkProfile, runs: RunResult[], modelInfo:
 async function runProfile(profile: BenchmarkProfile, index: Awaited<ReturnType<typeof buildIndex>>, repetitions: number) {
   await requestOllamaCompletion({
     baseUrl,
+    apiKey,
     model: profile.model,
     messages: [{ role: 'user', content: 'Ответь одним словом: готов.' }],
     settings: {
@@ -184,6 +185,7 @@ async function runProfile(profile: BenchmarkProfile, index: Awaited<ReturnType<t
     for (let repetition = 1; repetition <= repetitions; repetition += 1) {
       const completion = await requestOllamaCompletion({
         baseUrl,
+        apiKey,
         model: profile.model,
         messages: [
           { role: 'system', content: profile.prompt },
@@ -288,6 +290,7 @@ function markdownReport(report: {
 }
 
 const baseUrl = textEnv('MODEL_LOCAL_BASE_URL');
+const apiKey = process.env.MODEL_LOCAL_API_KEY?.trim() || null;
 const defaultModel = textEnv('MODEL_LOCAL_NAME');
 const repetitions = Math.max(1, Math.floor(numberEnv('LOCAL_LLM_BENCHMARK_REPETITIONS', 3)));
 const agentDefinition = await readFile(path.resolve(process.cwd(), 'agents/simple-agent.md'), 'utf8');
@@ -335,7 +338,7 @@ try {
   for (const profile of profiles) {
     allRuns[profile.id] = await runProfile(profile, index, repetitions);
     try {
-      modelInfo[profile.id] = await inspectOllamaModel(baseUrl, profile.model);
+      modelInfo[profile.id] = await inspectOllamaModel(baseUrl, profile.model, apiKey);
     } catch (error) {
       console.warn(`Не удалось прочитать параметры модели ${profile.model}:`, error);
     }

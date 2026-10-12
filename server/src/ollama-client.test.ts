@@ -22,9 +22,11 @@ test('Ollama duration helpers expose milliseconds and tokens per second', () => 
 test('native Ollama request sends generation limits and reads performance metrics', async () => {
   let receivedBody: Record<string, unknown> | null = null;
   let receivedUrl = '';
+  let receivedAuthorization = '';
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     receivedUrl = String(input);
+    receivedAuthorization = new Headers(init?.headers).get('Authorization') ?? '';
     receivedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(JSON.stringify({
         message: { content: '{"answer":"ok","citations":[]}' },
@@ -39,6 +41,7 @@ test('native Ollama request sends generation limits and reads performance metric
   try {
     const result = await requestOllamaCompletion({
       baseUrl: 'http://ollama.test:11434/v1',
+      apiKey: 'private-test-key',
       model: 'test-model',
       messages: [{ role: 'user', content: 'test' }],
       json: true,
@@ -47,6 +50,7 @@ test('native Ollama request sends generation limits and reads performance metric
     const actualBody = receivedBody as unknown as Record<string, unknown>;
     const options = actualBody.options as Record<string, unknown>;
     assert.equal(receivedUrl, 'http://ollama.test:11434/api/chat');
+    assert.equal(receivedAuthorization, 'Bearer private-test-key');
     assert.deepEqual(options, { temperature: 0.1, num_ctx: 8192, num_predict: 600, top_p: 0.9, seed: 42 });
     assert.equal(actualBody.format, 'json');
     assert.equal(result.inputTokens, 100);

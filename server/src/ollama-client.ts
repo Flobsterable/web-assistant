@@ -95,8 +95,13 @@ async function readJson<T extends { error?: string }>(response: Response): Promi
   return data;
 }
 
+function authorizationHeaders(apiKey?: string | null): Record<string, string> {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+}
+
 export async function requestOllamaCompletion(params: {
   baseUrl: string;
+  apiKey?: string | null;
   model: string;
   messages: OllamaMessage[];
   settings: OllamaGenerationSettings;
@@ -105,7 +110,7 @@ export async function requestOllamaCompletion(params: {
   const startedAt = performance.now();
   const response = await fetch(`${ollamaNativeBaseUrl(params.baseUrl)}/api/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authorizationHeaders(params.apiKey) },
     body: JSON.stringify({
       model: params.model,
       messages: params.messages,
@@ -143,15 +148,17 @@ export async function requestOllamaCompletion(params: {
   };
 }
 
-export async function inspectOllamaModel(baseUrl: string, model: string): Promise<OllamaModelInfo> {
+export async function inspectOllamaModel(baseUrl: string, model: string, apiKey?: string | null): Promise<OllamaModelInfo> {
   const nativeBaseUrl = ollamaNativeBaseUrl(baseUrl);
   const showResponse = await fetch(`${nativeBaseUrl}/api/show`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authorizationHeaders(apiKey) },
     body: JSON.stringify({ model })
   });
   const show = await readJson<OllamaShowResponse>(showResponse);
-  const psResponse = await fetch(`${nativeBaseUrl}/api/ps`);
+  const psResponse = await fetch(`${nativeBaseUrl}/api/ps`, {
+    headers: authorizationHeaders(apiKey)
+  });
   const ps = await readJson<OllamaPsResponse>(psResponse);
   const loaded = ps.models?.find((candidate) => candidate.name === model || candidate.model === model);
 

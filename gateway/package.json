@@ -1,0 +1,14 @@
+{
+  "name": "local-llm-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env server.mjs",
+    "check": "node --check server.mjs && node --check smoke-test.mjs",
+    "test": "node --test server.test.mjs",
+    "smoke": "node --env-file=.env smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=20.6"
+  }
+}

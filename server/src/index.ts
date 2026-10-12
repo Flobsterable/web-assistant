@@ -691,6 +691,7 @@ async function requestCompletion(
   if (config.provider === 'ollama') {
     const result = await requestOllamaCompletion({
       baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
       model: config.model,
       messages,
       json: options?.json,
@@ -1401,7 +1402,10 @@ app.get('/api/ollama/status', async (_req: Request, res: Response) => {
   }
 
   try {
-    const response = await fetch(`${model.baseUrl}/models`, { signal: AbortSignal.timeout(5_000) });
+    const response = await fetch(`${model.baseUrl}/models`, {
+      headers: model.apiKey ? { Authorization: `Bearer ${model.apiKey}` } : {},
+      signal: AbortSignal.timeout(5_000)
+    });
     const data = await response.json() as { data?: Array<{ id?: string }>; error?: { message?: string } };
     if (!response.ok) throw new Error(data.error?.message ?? `Ollama вернула HTTP ${response.status}.`);
     const models = (data.data ?? []).flatMap((item) => typeof item.id === 'string' ? [item.id] : []);
