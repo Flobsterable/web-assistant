@@ -1166,6 +1166,18 @@ h1 {
 .rag-result-card li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rag-result-card li b { color: #2d806f; }
 .rag-diagnostics > footer { margin-top: 8px; color: #71808a; }
+.model-comparison { margin-top: 10px; border: 1px solid #d9dfec; border-radius: 9px; padding: 10px; color: #52606e; background: #fafbff; font-size: 10px; }
+.model-comparison > summary { cursor: pointer; color: #405b86; font-weight: 700; }
+.model-comparison-table { display: grid; gap: 1px; margin-top: 9px; overflow: hidden; border: 1px solid #e0e5ef; border-radius: 7px; background: #e0e5ef; }
+.model-comparison-row { display: grid; grid-template-columns: minmax(150px, 1.5fr) repeat(5, minmax(82px, 1fr)); gap: 8px; align-items: center; padding: 8px; background: #fff; }
+.model-comparison-heading { color: #7a8797; background: #f3f5f9; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.model-comparison-row span { min-width: 0; }
+.model-comparison-row span:first-child { display: flex; flex-direction: column; }
+.model-comparison-row strong { overflow: hidden; color: #2f4056; text-overflow: ellipsis; white-space: nowrap; }
+.model-comparison-row small { margin-top: 2px; color: #8491a1; }
+.model-comparison-row [data-status="grounded"] { color: #27735d; font-weight: 700; }
+.model-comparison-row [data-status="unknown"] { color: #a05b4b; font-weight: 700; }
+.model-comparison > p { margin: 8px 0 0; color: #71808f; line-height: 1.45; }
 .rag-answer-comparison { margin-top: 10px; border: 1px solid #cddfd9; border-radius: 9px; padding: 10px; background: #f8fbfa; }
 .rag-answer-comparison > header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; color: #253540; font-size: 11px; }
 .rag-answer-comparison > header span { color: #71808a; font-size: 9px; }
@@ -1177,6 +1189,8 @@ h1 {
 
 @media (max-width: 760px) {
   .rag-answer-comparison > div, .rag-comparison-grid { grid-template-columns: 1fr; }
+  .model-comparison-table { overflow-x: auto; }
+  .model-comparison-row { min-width: 690px; }
 }
 
 .compression-meta {

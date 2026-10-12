@@ -138,6 +138,62 @@ export async function validateGroundedAnswerWithRetry(params: {
   return validateGroundedAnswer(retriedAnswer, params.matches, params.relevanceThreshold, params.responseMode);
 }
 
+export function createExtractiveGroundedAnswer(
+  question: string,
+  matches: RagMatch[],
+  relevanceThreshold = 0
+): GroundedAnswerResult {
+  const eligibleMatches = matches.filter((match) => match.relevanceScore >= relevanceThreshold);
+  if (eligibleMatches.length === 0) return createUnknownResult('no_relevant_chunks');
+
+  const questionTokens = [...new Set(tokenize(question))];
+  if (questionTokens.length === 0) return createUnknownResult('insufficient_context');
+
+  const candidates = eligibleMatches.flatMap((match) =>
+    (match.content.match(/[^.!?\n]+[.!?]?/gu) ?? [])
+      .map((quote) => quote.trim())
+      .filter((quote) => quote.length >= 16 && !/^#{1,6}\s/.test(quote))
+      .map((quote) => {
+        const quoteTokens = tokenize(quote);
+        const matchedTokens = questionTokens.filter((questionToken) =>
+          quoteTokens.some((quoteToken) => wordsMatch(questionToken.replace(/[.#-]+/g, ''), quoteToken.replace(/[.#-]+/g, '')))
+        );
+        return {
+          match,
+          quote,
+          matchedTokens,
+          score: matchedTokens.length / questionTokens.length + match.relevanceScore * 0.1
+        };
+      })
+      .filter((candidate) => candidate.matchedTokens.length > 0)
+  ).sort((left, right) => right.score - left.score || right.quote.length - left.quote.length);
+
+  const selected: typeof candidates = [];
+  const coveredTokens = new Set<string>();
+  for (const candidate of candidates) {
+    if (candidate.matchedTokens.every((token) => coveredTokens.has(token))) continue;
+    selected.push(candidate);
+    candidate.matchedTokens.forEach((token) => coveredTokens.add(token));
+    if (selected.length >= 4 || coveredTokens.size === questionTokens.length) break;
+  }
+
+  if (coveredTokens.size / questionTokens.length < 0.5 || selected.length === 0) {
+    return createUnknownResult('insufficient_context');
+  }
+
+  const citations = selected.map(({ match, quote }) => ({
+    source: match.metadata.source,
+    section: match.metadata.section,
+    chunkId: match.metadata.chunk_id,
+    quote
+  }));
+  return {
+    status: 'grounded',
+    answer: selected.map(({ quote }) => quote).join(' '),
+    citations: deduplicateCitations(citations)
+  };
+}
+
 export function answerMeaningMatchesCitations(answer: string, citations: GroundedCitation[]) {
   const answerTokens = semanticTokens(answer);
   if (answerTokens.length === 0 || citations.length === 0) return false;

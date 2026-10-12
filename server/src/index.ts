@@ -66,6 +66,7 @@ import {
   type RagMode
 } from './rag-pipeline.js';
 import {
+  createExtractiveGroundedAnswer,
   createGroundingMessage,
   formatGroundedAnswer,
   isPersonalWriteTool,
@@ -657,7 +658,7 @@ function buildChatCompletionsUrl(baseUrl: string) {
 async function requestCompletion(
   config: ModelConfig,
   messages: AgentMessage[],
-  options?: { temperature?: number }
+  options?: { temperature?: number; json?: boolean }
 ): Promise<CompletionResult> {
   if (config.provider === 'gemini') {
     return requestGeminiCompletion(config, messages, options);
@@ -669,7 +670,7 @@ async function requestCompletion(
 async function requestOpenAiCompatibleCompletion(
   config: ModelConfig,
   messages: AgentMessage[],
-  options?: { temperature?: number }
+  options?: { temperature?: number; json?: boolean }
 ): Promise<CompletionResult> {
   const startedAt = performance.now();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -683,6 +684,9 @@ async function requestOpenAiCompatibleCompletion(
     body.reasoning_effort = 'none';
   } else {
     body.thinking = { type: 'disabled' };
+  }
+  if (options?.json) {
+    body.response_format = { type: 'json_object' };
   }
   const response = await fetch(buildChatCompletionsUrl(config.baseUrl), {
     method: 'POST',
@@ -728,7 +732,7 @@ async function requestOpenAiCompatibleCompletion(
 async function requestGeminiCompletion(
   config: ModelConfig,
   messages: AgentMessage[],
-  options?: { temperature?: number }
+  options?: { temperature?: number; json?: boolean }
 ): Promise<CompletionResult> {
   const text = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : message.role === 'system' ? 'System' : 'User'}: ${message.content}`).join('\n\n');
   const startedAt = performance.now();
@@ -745,7 +749,8 @@ async function requestGeminiCompletion(
         }
       ],
       generationConfig: {
-        temperature: options?.temperature ?? 0.2
+        temperature: options?.temperature ?? 0.2,
+        ...(options?.json ? { responseMimeType: 'application/json' } : {})
       }
     })
   });
@@ -1114,7 +1119,7 @@ function createAgent(
 ) {
   const memoryStore = createAgentMemoryStore(sessionId, userProfile?.id);
   let activeRagMatches: RagMatch[] | null = null;
-  let activeRagRequest: string | null = null;
+  let activeExtractiveMatches: RagMatch[] = [];
   let activeResponseMode: ResponseMode = 'factual';
   const mcpRuntime = new McpAgentRuntime(
     new ProfileScopedMcpToolClient(
@@ -1159,12 +1164,18 @@ function createAgent(
     useWorkingMemory: memoryUsage?.working ?? true,
     useLongTermMemory: memoryUsage?.longTerm ?? true,
     taskMemoryMessage: taskMemory ? createTaskMemoryMessage(taskMemory) : undefined,
-    complete: (messages, options) => requestCompletion(agentModel, messages, options),
+    complete: (messages, options) => requestCompletion(agentModel, messages, {
+      ...options,
+      json: messages.some((message) => message.role === 'system' && message.content.includes('RAG_CONTEXT — единственный разрешённый источник'))
+    }),
     transformAnswer: async ({ answer, userRequest, toolCalls }) => {
       const usedKnowledgeSearch = toolCalls.some((call) => call.name === 'knowledge_search' && !call.isError);
       if (!useRag || !usedKnowledgeSearch || activeRagMatches === null) return { answer };
       const ragMatches = activeRagMatches;
-      const result = await validateGroundedAnswerWithRetry({
+      const verificationMatches = [...new Map(
+        [...ragMatches, ...activeExtractiveMatches].map((match) => [match.metadata.chunk_id, match])
+      ).values()];
+      const validatedResult = await validateGroundedAnswerWithRetry({
         rawAnswer: answer,
         matches: ragMatches,
         relevanceThreshold: readRagConfig().relevanceThreshold,
@@ -1175,18 +1186,26 @@ function createAgent(
             createGroundingMessage(ragMatches, activeResponseMode),
             {
               role: 'system',
-              content: 'Предыдущая попытка нарушила JSON-контракт. Верни ровно один JSON-объект без пояснений, markdown и текста до или после него.'
+              content: [
+                'Предыдущая попытка нарушила JSON-контракт.',
+                'Ответь именно на короткий вопрос пользователя ниже, используя уже отобранный RAG_CONTEXT.',
+                'Если ответ буквально присутствует в чанке, нельзя возвращать пустые answer и citations.',
+                'Верни ровно один JSON-объект без пояснений, markdown и текста до или после него.'
+              ].join(' ')
             },
-            { role: 'user', content: activeRagRequest ?? userRequest }
-          ], { temperature: 0 })).answer;
+            { role: 'user', content: userRequest }
+          ], { temperature: 0, json: true })).answer;
         }
       });
-      return { answer: formatGroundedAnswer(result), grounding: toAgentGrounding(result, ragMatches) };
+      const result = validatedResult.status === 'unknown' && activeResponseMode === 'factual'
+        ? createExtractiveGroundedAnswer(userRequest, verificationMatches, readRagConfig().relevanceThreshold)
+        : validatedResult;
+      return { answer: formatGroundedAnswer(result), grounding: toAgentGrounding(result, verificationMatches) };
     },
     toolRuntime: {
       async resolve(userRequest) {
         activeRagMatches = null;
-        activeRagRequest = null;
+        activeExtractiveMatches = [];
         activeResponseMode = classifyResponseMode(userRequest);
         if (!useRag) return mcpRuntime.resolve(userRequest);
 
@@ -1216,7 +1235,6 @@ function createAgent(
         }
 
         const memoryQuery = taskMemory ? buildTaskMemorySearchQuery(userRequest, taskMemory, ragHistory) : userRequest;
-        activeRagRequest = memoryQuery;
         let rewrittenQuery = memoryQuery;
         if (ragMode !== 'baseline') {
           try {
@@ -1251,6 +1269,18 @@ function createAgent(
             : baseRagConfig,
           sourceNames: attachedDocumentNames
         });
+        const extractiveRetrieval = runRagRetrieval({
+          index,
+          originalQuery: userRequest,
+          rewrittenQuery: userRequest,
+          strategy: retrievalStrategy,
+          mode: 'improved',
+          config: baseRagConfig,
+          sourceNames: attachedDocumentNames
+        });
+        activeExtractiveMatches = extractiveRetrieval.improved.selected.filter(
+          (match) => match.relevanceScore >= extractiveRetrieval.config.relevanceThreshold
+        );
         const matches = retrieval.active.selected.filter(
           (match) => match.relevanceScore >= retrieval.config.relevanceThreshold
         );

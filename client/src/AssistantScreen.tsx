@@ -16,6 +16,7 @@ type AgentResponse = {
   elapsedMs: number;
   finishReason: string | null;
   agentName: string;
+  agentProvider: 'openai-compatible' | 'gemini' | 'ollama';
   modelTitle: string;
   model: string;
   session?: AgentSession;
@@ -133,6 +134,11 @@ type ChatMessage = {
   tokenMeta?: RequestTokenMeta;
   responseMeta?: ResponseTokenMeta;
   grounding?: Grounding;
+};
+
+type ModelComparisonEntry = {
+  message: ChatMessage;
+  request: string;
 };
 
 type AgentSession = {
@@ -442,6 +448,83 @@ function getRagDiagnostics(message: ChatMessage): RagDiagnostics | null {
   }
 }
 
+function comparisonRequestKey(value: string) {
+  return value
+    .replace(/\n\n📎[\s\S]*$/, '')
+    .trim()
+    .toLocaleLowerCase('ru-RU')
+    .replace(/\s+/g, ' ');
+}
+
+function buildModelComparisonGroups(messages: ChatMessage[]) {
+  const entries: ModelComparisonEntry[] = [];
+  let latestRequest = '';
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      latestRequest = message.content;
+    } else if (message.meta && latestRequest) {
+      entries.push({ message, request: latestRequest });
+    }
+  }
+
+  const byRequest = new Map<string, ModelComparisonEntry[]>();
+  for (const entry of entries) {
+    const key = comparisonRequestKey(entry.request);
+    byRequest.set(key, [...(byRequest.get(key) ?? []), entry]);
+  }
+
+  return new Map(entries.map((entry) => [
+    entry.message.id,
+    byRequest.get(comparisonRequestKey(entry.request)) ?? [entry]
+  ]));
+}
+
+function modelLocation(provider: AgentResponse['agentProvider']) {
+  return provider === 'ollama' ? 'локальная' : 'облачная';
+}
+
+function ModelComparisonPanel({ entries }: { entries: ModelComparisonEntry[] }) {
+  const rows = entries.map(({ message }) => {
+    const meta = message.meta as AgentResponse;
+    const diagnostics = getRagDiagnostics(message);
+    const active = diagnostics
+      ? diagnostics.active === 'baseline' ? diagnostics.baseline : diagnostics.improved
+      : null;
+    const grounding = meta.grounding ?? message.grounding;
+    return { message, meta, active, grounding };
+  });
+  const providers = new Set(rows.map(({ meta }) => meta.agentProvider));
+  const repeatedModels = new Set(rows.map(({ meta }) => meta.model)).size < rows.length;
+
+  return (
+    <details className="model-comparison" open={rows.length > 1}>
+      <summary>Сравнение моделей · {rows.length} {rows.length === 1 ? 'прогон' : 'прогона'}</summary>
+      <div className="model-comparison-table" role="table" aria-label="Сравнение ответов моделей">
+        <div className="model-comparison-row model-comparison-heading" role="row">
+          <span>Модель</span><span>Время</span><span>Grounding</span><span>Релевантность</span><span>Токены</span><span>Стоимость</span>
+        </div>
+        {rows.map(({ message, meta, active, grounding }) => (
+          <div className="model-comparison-row" role="row" key={message.id}>
+            <span><strong>{meta.modelTitle}</strong><small>{modelLocation(meta.agentProvider)}</small></span>
+            <span>{formatDuration(meta.elapsedMs)}</span>
+            <span data-status={grounding?.status ?? 'unknown'}>{grounding?.status === 'grounded' ? 'подтверждён' : 'нет'}</span>
+            <span>{active ? `${Math.round(active.averageRelevance * 100)}% · ${active.selectedCount} фрагм.` : '—'}</span>
+            <span>{formatTokens(meta.totalTokens)}</span>
+            <span>{formatCost(meta.cost, meta.priceCurrency)}</span>
+          </div>
+        ))}
+      </div>
+      {providers.size < 2 ? (
+        <p>Для сравнения локальной и облачной моделей переключите модель и повторите этот же вопрос без изменений.</p>
+      ) : (
+        <p>Качество оценивается по grounding и релевантности источников; скорость — по полному времени ответа.</p>
+      )}
+      {repeatedModels && <p>Повторные прогоны одной модели позволяют оценить стабильность времени и grounding.</p>}
+    </details>
+  );
+}
+
 function RagResultCard({
   title,
   result,
@@ -505,7 +588,7 @@ function RagDiagnosticsPanel({ diagnostics }: { diagnostics: RagDiagnostics }) {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, comparisonEntries = [] }: { message: ChatMessage; comparisonEntries?: ModelComparisonEntry[] }) {
   const isAgent = message.role === 'agent';
   const visibleMemoryEvents = message.meta?.memoryEvents?.filter((event) => event.type !== 'skipped' && event.type !== 'invalid_candidate') ?? [];
   const ragDiagnostics = getRagDiagnostics(message);
@@ -553,6 +636,9 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </details>
       )}
       {ragDiagnostics && <RagDiagnosticsPanel diagnostics={ragDiagnostics} />}
+      {isAgent && message.meta && (
+        <ModelComparisonPanel entries={comparisonEntries.length > 0 ? comparisonEntries : [{ message, request: '' }]} />
+      )}
       {message.meta?.contextManagement && (
         <details className="message-details">
           <summary>Технические детали</summary>
@@ -679,6 +765,7 @@ export default function AssistantScreen({
   const [isSavingInvariant, setIsSavingInvariant] = useState(false);
   const [activeView, setActiveView] = useState<AssistantView>(requestedView);
   const [settingsRetrievalStrategy, setSettingsRetrievalStrategy] = useState<RetrievalStrategy>(retrievalStrategy);
+  const modelComparisonGroups = useMemo(() => buildModelComparisonGroups(messages), [messages]);
 
   useEffect(() => {
     setActiveView(requestedView);
@@ -1657,7 +1744,13 @@ export default function AssistantScreen({
           {messages.length === 0 ? (
             <div className="empty-state">Начните диалог — напишите сообщение ниже.</div>
           ) : (
-            messages.map((chatMessage) => <MessageBubble key={chatMessage.id} message={chatMessage} />)
+            messages.map((chatMessage) => (
+              <MessageBubble
+                key={chatMessage.id}
+                message={chatMessage}
+                comparisonEntries={modelComparisonGroups.get(chatMessage.id)}
+              />
+            ))
           )}
           {isLoading && (
             <article className="message agent">

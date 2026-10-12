@@ -3,7 +3,7 @@ import { copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { answerMeaningMatchesCitations, formatGroundedAnswer, isPersonalWriteTool, validateGroundedAnswer, validateGroundedAnswerWithRetry } from './grounded-answer.js';
+import { answerMeaningMatchesCitations, createExtractiveGroundedAnswer, formatGroundedAnswer, isPersonalWriteTool, validateGroundedAnswer, validateGroundedAnswerWithRetry } from './grounded-answer.js';
 import { buildIndex } from './indexer.js';
 import type { RagMatch } from './rag-pipeline.js';
 
@@ -213,6 +213,42 @@ test('malformed model output is retried against the same verified chunks', async
   });
   assert.equal(retries, 1);
   assert.equal(result.status, 'grounded');
+});
+
+test('extractive fallback answers a factual RTO/RPO question when a local model returns empty JSON', () => {
+  const match: RagMatch = {
+    content: [
+      'Целевой уровень доступности промышленной системы — **99,93% в месяц**.',
+      'Параметры восстановления: **RTO — 45 минут**, **RPO — 12 минут**.',
+      'Резервное копирование выполняется каждые 10 минут.'
+    ].join('\n'),
+    metadata: { source: 'operations.md', title: 'Эксплуатация', section: 'Надёжность', chunk_id: 'ops-1', strategy: 'structural' },
+    embedding: [], token_count: 30, score: 0.8, relevanceScore: 0.34
+  };
+
+  const result = createExtractiveGroundedAnswer(
+    'Каковы RTO, RPO и целевая доступность?',
+    [match],
+    0.22
+  );
+
+  assert.equal(result.status, 'grounded');
+  if (result.status !== 'grounded') return;
+  assert.match(result.answer, /99,93%/);
+  assert.match(result.answer, /RTO — 45 минут/);
+  assert.match(result.answer, /RPO — 12 минут/);
+  assert.equal(result.citations.length, 2);
+  assert.ok(result.citations.every((citation) => match.content.includes(citation.quote)));
+});
+
+test('extractive fallback refuses a question whose distinctive terms are absent', () => {
+  const match: RagMatch = {
+    content: 'Проект «Аврора» использует систему прогнозирования спроса.',
+    metadata: { source: 'overview.md', title: 'Аврора', section: 'Обзор', chunk_id: 'overview-1', strategy: 'structural' },
+    embedding: [], token_count: 10, score: 0.4, relevanceScore: 0.3
+  };
+  const result = createExtractiveGroundedAnswer('Где находится московский офис проекта Аврора?', [match], 0.22);
+  assert.equal(result.status, 'unknown');
 });
 
 test('synthesis mode accepts a derived plan while still requiring exact document citations', () => {
